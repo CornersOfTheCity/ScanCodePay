@@ -1,0 +1,13 @@
+mysql:
+  host: "localhost"
+  port: 3306
+  user: "root"
+  password: ""
+  dbname: "CodePayDB"
+solana:
+  rpc_url: ""
+  ws_url: ""
+  usdc_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+app:
+  poll_interval: 2  # 历史同步间隔（秒）
+  port: 8080
