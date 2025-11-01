@@ -1,9 +1,7 @@
 package handler
 
 import (
-	"fmt"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -51,9 +49,9 @@ func SignTxHandler(c *gin.Context) {
 // RefundHandler 退款接口（原 broadcastTx 接口）
 func RefundHandler(c *gin.Context) {
 	var req struct {
-		OrderID    string `json:"orderId" binding:"required"`     // 原收款订单ID
-		RefundTo   string `json:"refundTo" binding:"required"`    // 退款收款人地址
-		Amount     uint64 `json:"amount" binding:"required"`      // 退款金额（lamports）
+		OrderID  string `json:"orderId" binding:"required"`  // 原收款订单ID
+		RefundTo string `json:"refundTo" binding:"required"` // 退款收款人地址
+		Amount   uint64 `json:"amount" binding:"required"`   // 退款金额（lamports）
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -102,12 +100,8 @@ func RefundHandler(c *gin.Context) {
 		return
 	}
 
-	// 生成退款订单ID（使用时间戳+原订单ID确保唯一）
-	refundOrderID := fmt.Sprintf("refund-%d-%s", time.Now().Unix(), req.OrderID)
-
 	// 保存退款记录
 	refundRecord := &models.RefundTransaction{
-		RefundOrderID:  refundOrderID,
 		OriginalOrderID: req.OrderID,
 		RefundTo:        req.RefundTo,
 		Amount:          req.Amount,
@@ -121,9 +115,9 @@ func RefundHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"refundOrderId": refundOrderID,
-		"signature":     signature,
-		"explorerUrl":   explorerURL,
+		"originalOrderID": req.OrderID,
+		"signature":       signature,
+		"explorerUrl":     explorerURL,
 	})
 }
 

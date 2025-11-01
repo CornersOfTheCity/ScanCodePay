@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/gagliardetto/solana-go"
@@ -14,10 +15,10 @@ import (
 )
 
 var (
-	Client      *rpc.Client
-	Payer       solana.PrivateKey
-	RefundPayer solana.PrivateKey // 退款账户私钥
-	USDCmint    solana.PublicKey  // USDC mint 地址
+	Client   *rpc.Client
+	Payer    solana.PrivateKey
+	Refund   solana.PrivateKey // 退款账户私钥
+	USDCmint solana.PublicKey // USDC mint 地址
 	// txMutex 用于保护并发交易发送，虽然 Solana 没有 nonce 问题，
 	// 但为了避免 RPC 节点限制和账户余额问题，使用互斥锁确保顺序处理
 	txMutex sync.Mutex
@@ -72,7 +73,7 @@ func InitSolana() error {
 	if err != nil {
 		return errors.New("failed to parse refund_secret as base58: " + err.Error())
 	}
-	RefundPayer = refundPk
+	Refund = refundPk
 
 	// 解析 USDC mint 地址
 	usdcPubkey, err := solana.PublicKeyFromBase58(usdcMint)
@@ -98,6 +99,29 @@ func GetPayerAddress() string {
 			}
 		}()
 		pubkey = Payer.PublicKey()
+		ok = true
+	}()
+	
+	if !ok || pubkey.IsZero() {
+		return ""
+	}
+	return pubkey.String()
+}
+
+// GetRefundAddress 返回退款账户地址（Refund 的公钥地址）
+func GetRefundAddress() string {
+	var pubkey solana.PublicKey
+	var ok bool
+	
+	// 使用匿名函数和 recover 安全地获取公钥
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// panic 被捕获，说明 Refund 未正确初始化
+				ok = false
+			}
+		}()
+		pubkey = Refund.PublicKey()
 		ok = true
 	}()
 	
@@ -260,9 +284,9 @@ func CreateRefundTx(ctx context.Context, orderID, refundTo string, refundAmount 
 		return "", "", ErrInvalidRequest
 	}
 
-	// 获取退款账户的 USDC Token Account
-	refundPayerPubkey := RefundPayer.PublicKey()
-	tokenAccounts, err := Client.GetTokenAccountsByOwner(ctx, refundPayerPubkey, &rpc.GetTokenAccountsConfig{
+	// 获取退款账户（Refund）的 USDC Token Account
+	refundPubkey := Refund.PublicKey()
+	tokenAccounts, err := Client.GetTokenAccountsByOwner(ctx, refundPubkey, &rpc.GetTokenAccountsConfig{
 		Mint: &USDCmint,
 	}, &rpc.GetTokenAccountsOpts{
 		Encoding: solana.EncodingBase64,
@@ -305,31 +329,49 @@ func CreateRefundTx(ctx context.Context, orderID, refundTo string, refundAmount 
 	// 构建账户列表
 	accounts := solana.AccountMetaSlice{
 		{PublicKey: sourceTokenAccount, IsSigner: false, IsWritable: true}, // Source
-		{PublicKey: destTokenAccount, IsSigner: false, IsWritable: true},    // Destination
-		{PublicKey: refundPayerPubkey, IsSigner: true, IsWritable: false},  // Owner (authority)
+		{PublicKey: destTokenAccount, IsSigner: false, IsWritable: true},   // Destination
+		{PublicKey: refundPubkey, IsSigner: true, IsWritable: false},       // Owner (authority)
 	}
 	
-	// 创建指令
-	instruction := solana.NewInstruction(
+	// 创建转账指令
+	transferInstruction := solana.NewInstruction(
 		tokenProgramID,
 		accounts,
 		transferData,
 	)
 
-	// 创建交易
+	// 创建 Memo 指令（格式：refund:orderId）
+	// Memo Program ID: MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr
+	memoProgramID := solana.MustPublicKeyFromBase58("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
+	memoText := fmt.Sprintf("refund:%s", orderID)
+	memoInstruction := solana.NewInstruction(
+		memoProgramID,
+		solana.AccountMetaSlice{},
+		[]byte(memoText),
+	)
+
+	// 创建交易，包含转账和Memo指令，使用Payer作为 fee payer（统一所有交易的fee payer）
+	// 这样所有USDC交易（收款和退款）都可以通过监听Payer地址统一捕获
+	payerPubkey := Payer.PublicKey()
 	tx, err := solana.NewTransaction(
-		[]solana.Instruction{instruction},
+		[]solana.Instruction{transferInstruction, memoInstruction},
 		bh.Value.Blockhash,
-		solana.TransactionPayer(refundPayerPubkey),
+		solana.TransactionPayer(payerPubkey),
 	)
 	if err != nil {
 		return "", "", errors.New("failed to create transaction")
 	}
 
 	// 签名交易
+	// 注意：需要Refund账户签名（USDC转账的authority）和Payer账户签名（fee payer）
 	_, err = tx.Sign(func(pk solana.PublicKey) *solana.PrivateKey {
-		if pk.Equals(refundPayerPubkey) {
-			return &RefundPayer
+		if pk.Equals(refundPubkey) {
+			// Refund账户签名：USDC转账的authority
+			return &Refund
+		}
+		if pk.Equals(payerPubkey) {
+			// Payer账户签名：fee payer
+			return &Payer
 		}
 		return nil
 	})

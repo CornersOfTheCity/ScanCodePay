@@ -8,8 +8,9 @@ solana:
   rpc_url: ""
   ws_url: ""
   usdc_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-  payer_secret: "your_payer_secret"
-  refund_secret: "your_refund_secret"  # 退款账户私钥（base58格式）
+  payer_secret: "your_payer_secret"  # 代付款账户私钥（base58格式）
+  refund_secret: "your_refund_secret"  # 退款账户私钥（base58格式），用于支付USDC 
 app:
   poll_interval: 2  # 历史同步间隔（秒）
   port: 8080
+  start_height: 0   # 起始高度（槽位），如果为0且数据库为空则直接从当前高度开始订阅

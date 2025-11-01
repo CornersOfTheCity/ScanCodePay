@@ -26,15 +26,15 @@ type Config struct {
 		DBName   string `mapstructure:"dbname"`
 	} `mapstructure:"mysql"`
 	Solana struct {
-		RPCURL       string `mapstructure:"rpc_url"`
-		WSURL        string `mapstructure:"ws_url"` // 新增：WebSocket URL，例如 "wss://api.mainnet-beta.solana.com"
-		USDC         string `mapstructure:"usdc_mint"`
-		PayerSecret  string `mapstructure:"payer_secret"`
-		RefundSecret string `mapstructure:"refund_secret"` // 退款账户私钥
+		RPCURL      string `mapstructure:"rpc_url"`
+		WSURL       string `mapstructure:"ws_url"` // 新增：WebSocket URL，例如 "wss://api.mainnet-beta.solana.com"
+		USDC        string `mapstructure:"usdc_mint"`
+		PayerSecret string `mapstructure:"payer_secret"` // 代付款账户私钥（同时用于收款和退款）
 	} `mapstructure:"solana"`
 	App struct {
-		PollInterval int `mapstructure:"poll_interval"` // 用于历史同步的间隔（秒），WebSocket 不需
-		Port         int `mapstructure:"port"`
+		PollInterval int    `mapstructure:"poll_interval"` // 用于历史同步的间隔（秒），WebSocket 不需
+		Port         int    `mapstructure:"port"`
+		StartHeight  uint64 `mapstructure:"start_height"` // 起始高度（槽位），如果为0且数据库为空则直接从当前高度开始订阅
 	} `mapstructure:"app"`
 }
 
@@ -64,29 +64,22 @@ func main() {
 	db.DB = dbConn
 
 	// 运行表结构迁移（创建新表或更新表结构）
-	if err := dbConn.AutoMigrate(&models.Address{}, &models.Transaction{}, &models.RefundTransaction{}); err != nil {
+	if err := dbConn.AutoMigrate(&models.Transaction{}, &models.RefundTransaction{}); err != nil {
 		log.Fatal("表迁移失败:", err)
 	}
 	fmt.Println("数据库初始化完成")
 
 	// 初始化 Solana 客户端与 Payer（从 config.yaml 读取配置）
 	if err := services.InitSolana(); err != nil {
-		log.Printf("初始化 Solana 客户端失败: %v", err)
+		log.Fatal("初始化 Solana 客户端失败:", err)
 	}
 
-	// 预加载地址列表（静态加载）
-	var addresses []models.Address
-	if err := dbConn.Find(&addresses).Error; err != nil {
-		log.Fatal("加载地址列表失败:", err)
-	}
-	if len(addresses) == 0 {
-		log.Fatal("未找到任何地址，请先插入地址到数据库")
-	}
-	fmt.Printf("加载 %d 个地址\n", len(addresses))
+	fmt.Println("只监控代付款地址的 USDC 交易")
 
 	// 初始化监听器（在后台 goroutine 中运行）
+	// 现在只监控代付款地址（Payer）的 USDC Token Account
 	ctx, cancel := context.WithCancel(context.Background())
-	go services.ListenerStart(ctx, dbConn, cfg.Solana.RPCURL, cfg.Solana.WSURL, cfg.Solana.USDC, time.Duration(cfg.App.PollInterval)*time.Second, addresses)
+	go services.ListenerStart(ctx, dbConn, cfg.Solana.RPCURL, cfg.Solana.WSURL, cfg.Solana.USDC, time.Duration(cfg.App.PollInterval)*time.Second, cfg.App.StartHeight)
 
 	// Gin 路由
 	r := gin.Default()
@@ -96,8 +89,11 @@ func main() {
 	// 路由
 	api := r.Group("/api")
 	{
-		// 交易查询
-		api.GET("/transaction/:orderId", handler.GetTransactionHandler)
+		// 收款交易查询（通过订单ID）
+		api.GET("/payment/:orderId", handler.GetPaymentHandler)
+
+		// 退款交易查询（通过订单ID，支持原订单ID或交易签名）
+		api.GET("/refund/:orderId", handler.GetRefundHandler)
 
 		// 签名账户地址查询
 		api.GET("/getPayerAddress", handler.GetPayerAddressHandler)
@@ -105,7 +101,7 @@ func main() {
 		// 签名
 		api.POST("/signTx", handler.SignTxHandler)
 
-		// 退款接口（原 broadcastTx）
+		// 退款接口
 		api.POST("/refund", handler.RefundHandler)
 	}
 

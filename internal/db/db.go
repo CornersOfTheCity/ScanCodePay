@@ -11,10 +11,10 @@ import (
 var DB *gorm.DB // 在 main 中赋值
 
 // 示例：获取地址列表
-func GetAddresses(db *gorm.DB) ([]models.Address, error) {
-	var addrs []models.Address
-	return addrs, db.Find(&addrs).Error
-}
+// func GetAddresses(db *gorm.DB) ([]models.Address, error) {
+// 	var addrs []models.Address
+// 	return addrs, db.Find(&addrs).Error
+// }
 
 // 示例：保存交易
 func SaveTransaction(db *gorm.DB, tx *models.Transaction) error {
@@ -33,10 +33,17 @@ func SaveRefundTransaction(db *gorm.DB, refund *models.RefundTransaction) error 
 	return db.Save(refund).Error
 }
 
-// 根据退款订单ID查询退款交易
-func GetRefundTransactionByRefundOrderID(db *gorm.DB, refundOrderID string) (*models.RefundTransaction, error) {
+// 根据交易签名查询退款交易
+func GetRefundTransactionBySignature(db *gorm.DB, txSignature string) (*models.RefundTransaction, error) {
 	var refund models.RefundTransaction
-	err := db.Where("refund_order_id = ?", refundOrderID).First(&refund).Error
+	err := db.Where("tx_signature = ?", txSignature).First(&refund).Error
+	return &refund, err
+}
+
+// 根据原订单ID查询退款交易
+func GetRefundTransactionByOriginalOrderID(db *gorm.DB, originalOrderID string) (*models.RefundTransaction, error) {
+	var refund models.RefundTransaction
+	err := db.Where("original_order_id = ?", originalOrderID).First(&refund).Error
 	return &refund, err
 }
 
@@ -97,4 +104,32 @@ func MigrateMemoToOrderID(db *gorm.DB) error {
 
 	log.Printf("迁移完成：成功更新 %d 条记录", updatedCount)
 	return nil
+}
+
+// GetMaxBlockHeight 获取数据库中最大的block_height（从收款和退款交易表中）
+func GetMaxBlockHeight(db *gorm.DB) (uint64, error) {
+	var maxHeight uint64
+
+	// 查询收款交易表中的最大高度
+	var maxTxHeight uint64
+	err := db.Model(&models.Transaction{}).Select("COALESCE(MAX(block_height), 0)").Scan(&maxTxHeight).Error
+	if err != nil {
+		return 0, err
+	}
+
+	// 查询退款交易表中的最大高度
+	var maxRefundHeight uint64
+	err = db.Model(&models.RefundTransaction{}).Select("COALESCE(MAX(block_height), 0)").Scan(&maxRefundHeight).Error
+	if err != nil {
+		return 0, err
+	}
+
+	// 取两者中的最大值
+	if maxTxHeight > maxRefundHeight {
+		maxHeight = maxTxHeight
+	} else {
+		maxHeight = maxRefundHeight
+	}
+
+	return maxHeight, nil
 }
