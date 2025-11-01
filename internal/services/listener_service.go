@@ -1,4 +1,4 @@
-package listener
+package services
 
 import (
 	"context"
@@ -14,6 +14,7 @@ import (
 	"gorm.io/gorm"
 
 	"ScanCodePay/internal/db"
+	"ScanCodePay/internal/models"
 )
 
 type Listener struct {
@@ -27,7 +28,7 @@ type Listener struct {
 	ctx                 context.Context
 }
 
-func Start(ctx context.Context, dbConn *gorm.DB, rpcURL, wsURL, usdcMint string, syncInterval time.Duration, addresses []db.Address) {
+func ListenerStart(ctx context.Context, dbConn *gorm.DB, rpcURL, wsURL, usdcMint string, syncInterval time.Duration, addresses []models.Address) {
 	rpcClient := rpc.New(rpcURL)
 	wsClient, err := ws.Connect(ctx, wsURL)
 	if err != nil {
@@ -84,10 +85,10 @@ func Start(ctx context.Context, dbConn *gorm.DB, rpcURL, wsURL, usdcMint string,
 	log.Println("监听器停止")
 }
 
-func (l *Listener) syncHistory(addresses []db.Address, interval time.Duration) error {
+func (l *Listener) syncHistory(addresses []models.Address, interval time.Duration) error {
 	successCount := 0
 	for _, addr := range addresses {
-		var latestAddr db.Address
+		var latestAddr models.Address
 		if err := l.db.Where("address = ?", addr.Address).First(&latestAddr).Error; err != nil {
 			log.Printf("地址 %s 数据库查询失败: %v，跳过", addr.Address, err)
 			continue // 跳过失败的地址，继续处理其他地址
@@ -218,7 +219,7 @@ func (l *Listener) syncHistory(addresses []db.Address, interval time.Duration) e
 }
 
 // syncHistoryGap 同步指定起始槽位到当前的所有交易（用于填补历史同步期间的空白）
-func (l *Listener) syncHistoryGap(addresses []db.Address, startSlot uint64, interval time.Duration) error {
+func (l *Listener) syncHistoryGap(addresses []models.Address, startSlot uint64, interval time.Duration) error {
 	// 获取当前最新槽位
 	currentSlot, err := l.client.GetSlot(l.ctx, rpc.CommitmentFinalized)
 	if err != nil {
@@ -232,7 +233,7 @@ func (l *Listener) syncHistoryGap(addresses []db.Address, startSlot uint64, inte
 	log.Printf("[GAP SYNC] 开始同步槽位 %d 到 %d", startSlot, currentSlot)
 
 	for _, addr := range addresses {
-		var latestAddr db.Address
+		var latestAddr models.Address
 		if err := l.db.Where("address = ?", addr.Address).First(&latestAddr).Error; err != nil {
 			continue
 		}
@@ -301,7 +302,7 @@ func (l *Listener) syncHistoryGap(addresses []db.Address, startSlot uint64, inte
 	return nil
 }
 
-func (l *Listener) subscribeAll(addresses []db.Address) error {
+func (l *Listener) subscribeAll(addresses []models.Address) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -378,7 +379,7 @@ func (l *Listener) handleNotifications(sub *ws.AccountSubscription, address stri
 		sigInfo := signatures[0]
 
 		// 检查槽位 > scan_height（避免重复）
-		var latestAddr db.Address
+		var latestAddr models.Address
 		l.db.Where("address = ?", address).First(&latestAddr)
 		if uint64(sigInfo.Slot) <= latestAddr.ScanHeight {
 			continue
@@ -542,7 +543,7 @@ func (l *Listener) processSignature(sigInfo *rpc.TransactionSignature, address s
 	orderID := strings.TrimSpace(memo)
 
 	// 保存交易（将完整的 Memo 保存为 OrderID）
-	txRecord := &db.Transaction{
+	txRecord := &models.Transaction{
 		OrderID:     orderID,
 		Address:     address,
 		Amount:      amount,
@@ -556,7 +557,7 @@ func (l *Listener) processSignature(sigInfo *rpc.TransactionSignature, address s
 	log.Printf("处理交易 %s: 订单 %s, 金额 %d", txRecord.TXSignature, orderID, amount)
 
 	// 更新 scan_height
-	var latestAddr db.Address
+	var latestAddr models.Address
 	l.db.Where("address = ?", address).First(&latestAddr)
 	if uint64(sigInfo.Slot) > latestAddr.ScanHeight {
 		latestAddr.ScanHeight = uint64(sigInfo.Slot)

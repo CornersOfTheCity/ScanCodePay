@@ -8,6 +8,8 @@ solana:
   rpc_url: ""
   ws_url: ""
   usdc_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+  payer_secret: "your_payer_secret"
+  refund_secret: "your_refund_secret"  # 退款账户私钥（base58格式）
 app:
   poll_interval: 2  # 历史同步间隔（秒）
   port: 8080

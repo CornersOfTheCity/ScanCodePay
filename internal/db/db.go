@@ -1,6 +1,7 @@
 package db
 
 import (
+	"ScanCodePay/internal/models"
 	"log"
 	"strings"
 
@@ -10,21 +11,33 @@ import (
 var DB *gorm.DB // 在 main 中赋值
 
 // 示例：获取地址列表
-func GetAddresses(db *gorm.DB) ([]Address, error) {
-	var addrs []Address
+func GetAddresses(db *gorm.DB) ([]models.Address, error) {
+	var addrs []models.Address
 	return addrs, db.Find(&addrs).Error
 }
 
 // 示例：保存交易
-func SaveTransaction(db *gorm.DB, tx *Transaction) error {
+func SaveTransaction(db *gorm.DB, tx *models.Transaction) error {
 	return db.Save(tx).Error
 }
 
 // 示例：根据订单 ID 查询交易
-func GetTransactionByOrderID(db *gorm.DB, orderID string) (*Transaction, error) {
-	var tx Transaction
+func GetTransactionByOrderID(db *gorm.DB, orderID string) (*models.Transaction, error) {
+	var tx models.Transaction
 	err := db.Where("order_id = ?", orderID).First(&tx).Error
 	return &tx, err
+}
+
+// 保存退款交易
+func SaveRefundTransaction(db *gorm.DB, refund *models.RefundTransaction) error {
+	return db.Save(refund).Error
+}
+
+// 根据退款订单ID查询退款交易
+func GetRefundTransactionByRefundOrderID(db *gorm.DB, refundOrderID string) (*models.RefundTransaction, error) {
+	var refund models.RefundTransaction
+	err := db.Where("refund_order_id = ?", refundOrderID).First(&refund).Error
+	return &refund, err
 }
 
 // MigrateMemoToOrderID 将数据库中已有记录的 Memo 提取为 OrderID
