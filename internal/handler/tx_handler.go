@@ -101,9 +101,41 @@ func RefundHandler(c *gin.Context) {
 		return
 	}
 
-	// 验证退款金额不能大于收款金额
+	// 查询该订单的所有退款记录
+	existingRefunds, err := db.GetRefundTransactionsByOriginalOrderID(db.DB, req.OrderID)
+	if err != nil && err != gorm.ErrRecordNotFound {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询退款记录失败"})
+		return
+	}
+
+	// 计算已退款总金额
+	// 注意：同时计算 "confirmed" 和 "pending" 状态的退款，避免并发退款导致超额
+	var totalRefundedAmount uint64 = 0
+	for _, refund := range existingRefunds {
+		// 计算已确认和待处理的退款（排除失败的退款）
+		if refund.Status == "confirmed" || refund.Status == "pending" {
+			totalRefundedAmount += refund.Amount
+		}
+	}
+
+	// 验证：已退款总金额 + 本次退款金额不能大于原订单金额
+	if totalRefundedAmount+req.Amount > originalTx.Amount {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "退款金额超出限制",
+			"detail": map[string]interface{}{
+				"originalAmount":  originalTx.Amount,
+				"totalRefunded":   totalRefundedAmount,
+				"currentRefund":   req.Amount,
+				"remainingAmount": originalTx.Amount - totalRefundedAmount,
+				"exceededAmount":  (totalRefundedAmount + req.Amount) - originalTx.Amount,
+			},
+		})
+		return
+	}
+
+	// 验证单次退款金额不能大于收款金额（保留原有验证，但允许多次退款）
 	if req.Amount > originalTx.Amount {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "退款金额不能大于收款金额"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "单次退款金额不能大于收款金额"})
 		return
 	}
 

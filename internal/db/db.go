@@ -40,11 +40,18 @@ func GetRefundTransactionBySignature(db *gorm.DB, txSignature string) (*models.R
 	return &refund, err
 }
 
-// 根据原订单ID查询退款交易
+// 根据原订单ID查询退款交易（只返回第一条）
 func GetRefundTransactionByOriginalOrderID(db *gorm.DB, originalOrderID string) (*models.RefundTransaction, error) {
 	var refund models.RefundTransaction
 	err := db.Where("original_order_id = ?", originalOrderID).First(&refund).Error
 	return &refund, err
+}
+
+// 根据原订单ID查询所有退款交易
+func GetRefundTransactionsByOriginalOrderID(db *gorm.DB, originalOrderID string) ([]models.RefundTransaction, error) {
+	var refunds []models.RefundTransaction
+	err := db.Where("original_order_id = ?", originalOrderID).Find(&refunds).Error
+	return refunds, err
 }
 
 // MigrateMemoToOrderID 将数据库中已有记录的 Memo 提取为 OrderID
