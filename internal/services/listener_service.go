@@ -289,8 +289,9 @@ func (l *Listener) processSignatureAsync(sigInfo *rpc.TransactionSignature, addr
 	defer func() { <-l.workerPool }()
 
 	// 快速去重检查（使用内存缓存）
+	// 注意：只检查，不在这里存储，等成功保存到数据库后再存储
 	sigStr := sigInfo.Signature.String()
-	if _, exists := l.processedSignatures.LoadOrStore(sigStr, true); exists {
+	if _, exists := l.processedSignatures.Load(sigStr); exists {
 		return nil // 已处理过，跳过
 	}
 
@@ -298,10 +299,6 @@ func (l *Listener) processSignatureAsync(sigInfo *rpc.TransactionSignature, addr
 }
 
 func (l *Listener) processSignature(sigInfo *rpc.TransactionSignature, address string) error {
-	if sigInfo.BlockTime == nil || *sigInfo.BlockTime == 0 {
-		return nil // 未确认，静默跳过（性能优化：减少日志）
-	}
-
 	// 获取交易详情，优先使用jsonParsed编码以便解析SPL Token指令
 	// 注意：某些交易可能因为版本问题无法用jsonParsed解析，需要回退到base64
 	var tx *rpc.GetTransactionResult
@@ -316,6 +313,16 @@ func (l *Listener) processSignature(sigInfo *rpc.TransactionSignature, address s
 		return err // 静默失败（性能优化）
 	}
 
+	// 如果 BlockTime 为空，尝试从交易结果中获取
+	if sigInfo.BlockTime == nil || *sigInfo.BlockTime == 0 {
+		if tx.BlockTime != nil && *tx.BlockTime > 0 {
+			sigInfo.BlockTime = tx.BlockTime
+		} else {
+			// 如果交易没有 BlockTime，可能是未确认的交易，跳过
+			return nil
+		}
+	}
+
 	if tx.Meta == nil {
 		return nil // 静默跳过
 	}
@@ -324,19 +331,76 @@ func (l *Listener) processSignature(sigInfo *rpc.TransactionSignature, address s
 	var memo string
 	if tx.Meta.LogMessages != nil {
 		for _, logMsg := range tx.Meta.LogMessages {
-			if strings.Contains(logMsg, "Program log: Memo") || strings.Contains(logMsg, "Memo (") {
+			// 处理格式：Program logged: "Memo (len 8): "12345678""
+			// 需要提取最后一个引号对内的内容（即实际的memo值）
+			if strings.Contains(logMsg, "Memo (len") {
+				// 查找 ": " 后面的引号（这是memo内容的开始）
+				colonIdx := strings.Index(logMsg, `": "`)
+				if colonIdx >= 0 {
+					// 从 colonIdx+4 开始查找结束引号
+					startIdx := colonIdx + 4
+					endIdx := strings.LastIndex(logMsg, `"`)
+					if endIdx > startIdx {
+						memo = logMsg[startIdx:endIdx]
+						memo = strings.TrimSpace(memo)
+						if memo != "" {
+							break
+						}
+					}
+				}
+				// 备选方案：如果上面没找到，尝试提取最后一个引号对
+				if memo == "" {
+					lastQuoteIdx := strings.LastIndex(logMsg, `"`)
+					if lastQuoteIdx >= 0 {
+						// 从后往前找前一个引号
+						prevQuoteIdx := -1
+						for i := lastQuoteIdx - 1; i >= 0; i-- {
+							if logMsg[i] == '"' {
+								prevQuoteIdx = i
+								break
+							}
+						}
+						if prevQuoteIdx >= 0 && prevQuoteIdx < lastQuoteIdx {
+							memo = logMsg[prevQuoteIdx+1 : lastQuoteIdx]
+							memo = strings.TrimSpace(memo)
+							// 如果提取的内容包含 "Memo (len"，说明提取错了，继续查找
+							if !strings.Contains(memo, "Memo (len") && memo != "" {
+								break
+							}
+							memo = "" // 重置，继续查找
+						}
+					}
+				}
+			}
+			// 处理格式：Program log: Memo "content" 或其他格式
+			if memo == "" && (strings.Contains(logMsg, "Program log: Memo") || strings.Contains(logMsg, "Memo (")) {
 				start := strings.Index(logMsg, "\"")
 				end := strings.LastIndex(logMsg, "\"")
 				if start >= 0 && end > start {
 					memo = logMsg[start+1 : end]
 					memo = strings.TrimSpace(memo)
+					// 如果包含 "Memo (len"，说明这是格式描述，需要提取后面的内容
+					if strings.Contains(memo, "Memo (len") {
+						// 继续查找下一个引号对
+						continue
+					}
 					break
 				}
 			}
+			// 处理格式：Memo: content
 			if memo == "" && strings.Contains(logMsg, "Memo:") {
 				parts := strings.Split(logMsg, "Memo:")
 				if len(parts) > 1 {
 					memo = strings.TrimSpace(parts[1])
+					// 如果包含引号，提取引号内的内容
+					if strings.Contains(memo, "\"") {
+						start := strings.Index(memo, "\"")
+						end := strings.LastIndex(memo, "\"")
+						if start >= 0 && end > start {
+							memo = memo[start+1 : end]
+							memo = strings.TrimSpace(memo)
+						}
+					}
 					break
 				}
 			}
@@ -345,6 +409,11 @@ func (l *Listener) processSignature(sigInfo *rpc.TransactionSignature, address s
 
 	// 第二步：根据memo判断交易类型，如果没有memo且不是退款格式，直接跳过（节省USDC转账解析）
 	isRefund := memo != "" && strings.HasPrefix(memo, "refund:")
+
+	// 调试日志：显示解析到的memo
+	if memo != "" {
+		log.Printf("[DEBUG] 交易 %s 解析到memo: %s", sigInfo.Signature.String(), memo)
+	}
 
 	if !isRefund && memo == "" {
 		// 收款交易必须有memo（订单ID），没有memo的交易直接跳过，不解析USDC转账
@@ -355,13 +424,25 @@ func (l *Listener) processSignature(sigInfo *rpc.TransactionSignature, address s
 	}
 
 	// 第三步：有memo才解析USDC转账（优化：只解析有memo的交易）
-	usdcTransfer, err := l.extractUSDCTransfer(tx)
+	log.Printf("[DEBUG] 开始提取USDC转账，交易: %s, memo: %s", sigInfo.Signature.String(), memo)
+	usdcTransfer, err := l.extractUSDCTransfer(tx, sigInfo.Signature)
 	if err != nil || usdcTransfer == nil {
+		// 如果有memo但提取USDC转账失败，记录日志以便调试
+		if memo != "" {
+			log.Printf("[WARN] 交易 %s 有memo (%s) 但无法提取USDC转账: %v", sigInfo.Signature.String(), memo, err)
+		}
 		return nil // 静默跳过
 	}
+	log.Printf("[DEBUG] USDC转账提取成功: 发送方=%s, 接收方=%s, 金额=%d",
+		usdcTransfer.SourceOwner.String(), usdcTransfer.DestOwner.String(), usdcTransfer.Amount)
 
 	// 第四步：根据memo判断交易类型并保存到对应表
-	return l.saveTransactionByType(isRefund, memo, sigInfo, usdcTransfer)
+	log.Printf("[DEBUG] 开始保存交易到数据库，交易: %s, 类型: %v", sigInfo.Signature.String(), isRefund)
+	if err := l.saveTransactionByType(isRefund, memo, sigInfo, usdcTransfer); err != nil {
+		log.Printf("[ERROR] 保存交易失败: %s, 错误: %v", sigInfo.Signature.String(), err)
+		return err
+	}
+	return nil
 }
 
 // USDCTransfer USDC转账信息
@@ -372,23 +453,71 @@ type USDCTransfer struct {
 }
 
 // extractUSDCTransfer 从TokenBalances提取USDC转账（不区分类型，提取所有USDC转账）
-func (l *Listener) extractUSDCTransfer(tx *rpc.GetTransactionResult) (*USDCTransfer, error) {
+func (l *Listener) extractUSDCTransfer(tx *rpc.GetTransactionResult, signature solana.Signature) (*USDCTransfer, error) {
 	// 查找所有USDC账户的余额变化
 	// 找到余额增加的账户（接收方）和余额减少的账户（发送方）
 	var sourceOwner, destOwner *solana.PublicKey
 	var transferAmount uint64
 
+	// 检查TokenBalances是否存在
+	if tx.Meta == nil {
+		return nil, fmt.Errorf("交易Meta为空")
+	}
+
+	log.Printf("[DEBUG] PreTokenBalances数量: %d, PostTokenBalances数量: %d",
+		len(tx.Meta.PreTokenBalances), len(tx.Meta.PostTokenBalances))
+
+	// 如果没有TokenBalances，尝试使用jsonParsed编码重新获取
+	if len(tx.Meta.PreTokenBalances) == 0 && len(tx.Meta.PostTokenBalances) == 0 {
+		log.Printf("[DEBUG] TokenBalances为空，尝试使用jsonParsed编码重新获取")
+		// 尝试使用jsonParsed编码重新获取交易详情
+		txParsed, err := l.client.GetTransaction(l.ctx, signature, &rpc.GetTransactionOpts{
+			Encoding: solana.EncodingJSONParsed,
+		})
+		if err == nil && txParsed != nil && txParsed.Meta != nil {
+			// 使用jsonParsed的结果
+			tx.Meta = txParsed.Meta
+			log.Printf("[DEBUG] 使用jsonParsed编码，PreTokenBalances数量: %d, PostTokenBalances数量: %d",
+				len(tx.Meta.PreTokenBalances), len(tx.Meta.PostTokenBalances))
+		} else {
+			log.Printf("[DEBUG] jsonParsed编码获取失败: %v", err)
+		}
+	}
+
+	// 如果TokenBalances中没有Owner信息，尝试使用jsonParsed编码重新获取
+	hasOwnerInfo := false
+	for _, post := range tx.Meta.PostTokenBalances {
+		if post.Mint == l.mintPubkey && post.Owner != nil {
+			hasOwnerInfo = true
+			break
+		}
+	}
+
+	if !hasOwnerInfo {
+		// base64编码可能没有Owner信息，尝试使用jsonParsed编码
+		txParsed, err := l.client.GetTransaction(l.ctx, signature, &rpc.GetTransactionOpts{
+			Encoding: solana.EncodingJSONParsed,
+		})
+		if err == nil && txParsed != nil && txParsed.Meta != nil {
+			// 使用jsonParsed的结果（包含Owner信息）
+			tx.Meta = txParsed.Meta
+		}
+	}
+
 	// 遍历所有PostTokenBalances，查找USDC余额增加的账户
-	// 性能优化：base64编码时Owner可能为nil，需要通过AccountIndex从交易中获取
+	usdcFound := 0
 	for _, post := range tx.Meta.PostTokenBalances {
 		if post.Mint != l.mintPubkey {
 			continue
 		}
-		// base64编码时Owner可能为nil，需要通过其他方式获取
+		usdcFound++
+
+		// base64编码时Owner可能为nil，如果仍为nil，跳过（已经尝试过jsonParsed）
 		if post.Owner == nil {
-			// base64编码时无法直接获取Owner，跳过（需要额外查询）
+			log.Printf("[DEBUG] USDC账户索引 %v 的Owner为nil，跳过", post.AccountIndex)
 			continue
 		}
+		log.Printf("[DEBUG] 检查USDC账户: Owner=%s, AccountIndex=%v", post.Owner.String(), post.AccountIndex)
 
 		// 找到对应的PreTokenBalance
 		for _, pre := range tx.Meta.PreTokenBalances {
@@ -458,7 +587,22 @@ func (l *Listener) extractUSDCTransfer(tx *rpc.GetTransactionResult) (*USDCTrans
 	}
 
 	if transferAmount == 0 || sourceOwner == nil || destOwner == nil {
-		return nil, fmt.Errorf("未找到有效的USDC转账")
+		// 添加详细的错误信息以便调试
+		var debugInfo string
+		if len(tx.Meta.PostTokenBalances) == 0 {
+			debugInfo = "PostTokenBalances为空"
+		} else if len(tx.Meta.PreTokenBalances) == 0 {
+			debugInfo = "PreTokenBalances为空"
+		} else {
+			usdcCount := 0
+			for _, post := range tx.Meta.PostTokenBalances {
+				if post.Mint == l.mintPubkey {
+					usdcCount++
+				}
+			}
+			debugInfo = fmt.Sprintf("找到%d个USDC账户，但无法确定转账关系", usdcCount)
+		}
+		return nil, fmt.Errorf("未找到有效的USDC转账: %s", debugInfo)
 	}
 
 	return &USDCTransfer{
@@ -481,15 +625,19 @@ func (l *Listener) saveRefundTransaction(memo string, sigInfo *rpc.TransactionSi
 	refundToAddress := transfer.DestOwner.String()
 	txSignature := sigInfo.Signature.String()
 
-	// 性能优化：先检查缓存，再查数据库
-	if _, exists := l.processedSignatures.Load(txSignature); exists {
-		return nil // 已处理过
-	}
+	// 注意：缓存检查在 processSignatureAsync 中已经完成，这里不需要再次检查
+	// 如果到达这里，说明是新交易，需要处理
 
 	// 检查数据库中是否已有此退款记录
 	var existingRefund models.RefundTransaction
-	if err := l.db.Where("tx_signature = ?", txSignature).First(&existingRefund).Error; err == nil {
+	err := l.db.Where("tx_signature = ?", txSignature).First(&existingRefund).Error
+	if err == nil {
+		log.Printf("[DEBUG] 退款交易 %s 已存在于数据库，跳过", txSignature)
 		return nil // 静默跳过
+	}
+	if err != gorm.ErrRecordNotFound {
+		log.Printf("[DEBUG] 查询退款交易时出错: %v", err)
+		// 继续执行，不因为查询错误而跳过保存
 	}
 
 	// 从memo中提取原订单ID
@@ -516,43 +664,57 @@ func (l *Listener) saveRefundTransaction(memo string, sigInfo *rpc.TransactionSi
 		Status:          "confirmed",
 	}
 	if err := db.SaveRefundTransaction(l.db, refundRecord); err != nil {
+		log.Printf("[ERROR] 保存退款交易失败: %s, 原订单: %s, 错误: %v", txSignature, originalOrderID, err)
 		return err
 	}
-	// 性能优化：只在关键成功时输出日志（可选）
-	// log.Printf("处理退款交易 %s: 原订单ID %s", refundRecord.TXSignature, originalOrderID)
+	log.Printf("[INFO] 成功处理退款交易: %s, 原订单: %s, 金额: %d",
+		refundRecord.TXSignature, originalOrderID, transfer.Amount)
+	// 成功保存后，将签名存入缓存，避免重复处理
+	l.processedSignatures.Store(txSignature, true)
 	return nil
 }
 
 // savePaymentTransaction 保存收款交易到数据库
 func (l *Listener) savePaymentTransaction(memo string, sigInfo *rpc.TransactionSignature, transfer *USDCTransfer) error {
 	orderID := strings.TrimSpace(memo)
-	payerAddress := transfer.SourceOwner.String()
+	senderAddress := transfer.SourceOwner.String() // 付款人地址
+	receiverAddress := transfer.DestOwner.String() // 收款人地址
 	txSignature := sigInfo.Signature.String()
 
-	// 性能优化：先检查缓存，再查数据库
-	if _, exists := l.processedSignatures.Load(txSignature); exists {
-		return nil // 已处理过
-	}
+	// 注意：缓存检查在 processSignatureAsync 中已经完成，这里不需要再次检查
+	// 如果到达这里，说明是新交易，需要处理
 
 	// 检查数据库中是否已有此收款记录
 	var existingTx models.Transaction
-	if err := l.db.Where("tx_signature = ? OR order_id = ?", txSignature, orderID).First(&existingTx).Error; err == nil {
+	err := l.db.Where("tx_signature = ? OR order_id = ?", txSignature, orderID).First(&existingTx).Error
+	if err == nil {
+		log.Printf("[DEBUG] 交易 %s 或订单 %s 已存在于数据库，跳过（已存在记录ID: %d）", txSignature, orderID, existingTx.ID)
 		return nil // 静默跳过
+	}
+	if err != gorm.ErrRecordNotFound {
+		log.Printf("[DEBUG] 查询数据库时出错: %v", err)
+		// 继续执行，不因为查询错误而跳过保存
 	}
 
 	txRecord := &models.Transaction{
-		OrderID:     orderID,
-		Address:     payerAddress,
-		Amount:      transfer.Amount,
-		TXSignature: txSignature,
-		BlockHeight: uint64(sigInfo.Slot),
-		Status:      "confirmed",
+		OrderID:         orderID,
+		ReceiverAddress: receiverAddress, // 收款人地址
+		SenderAddress:   senderAddress,   // 付款人地址
+		Amount:          transfer.Amount,
+		TXSignature:     txSignature,
+		BlockHeight:     uint64(sigInfo.Slot),
+		Status:          "confirmed",
 	}
+	log.Printf("[DEBUG] 准备保存交易到数据库: 订单=%s, 发送方=%s, 接收方=%s, 金额=%d, 签名=%s",
+		orderID, senderAddress, receiverAddress, transfer.Amount, txSignature)
 	if err := db.SaveTransaction(l.db, txRecord); err != nil {
+		log.Printf("[ERROR] 保存收款交易失败: %s, 订单: %s, 错误: %v", txSignature, orderID, err)
 		return err
 	}
-	// 性能优化：只在关键成功时输出日志（可选）
-	// log.Printf("处理收款交易 %s: 订单 %s", txRecord.TXSignature, orderID)
+	log.Printf("[INFO] 成功处理收款交易: %s, 订单: %s, 金额: %d, 记录ID: %d",
+		txRecord.TXSignature, orderID, transfer.Amount, txRecord.ID)
+	// 成功保存后，将签名存入缓存，避免重复处理
+	l.processedSignatures.Store(txSignature, true)
 	return nil
 }
 

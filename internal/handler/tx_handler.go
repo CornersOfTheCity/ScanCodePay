@@ -13,29 +13,54 @@ import (
 
 func SignTxHandler(c *gin.Context) {
 	var req struct {
-		SerializedTx string `json:"serializedTx"`
+		SerializedTx string `json:"serializedTx" binding:"required"` // base64 编码的序列化交易（用户已签名）
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil || req.SerializedTx == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":  "invalid request: serializedTx 字段是必需的",
+			"detail": "请提供 base64 编码的已签名交易字符串。流程：前端用户签名交易 → 序列化为 base64 → 发送到后端",
+		})
 		return
 	}
 
 	signature, explorerURL, err := services.SignTx(c.Request.Context(), req.SerializedTx)
 	if err != nil {
-		switch err {
-		case services.ErrInvalidRequest:
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
-		case services.ErrBadTx:
-			c.JSON(http.StatusBadRequest, gin.H{"error": "bad tx"})
-		case services.ErrPartialSignFailed:
-			c.JSON(http.StatusBadRequest, gin.H{"error": "partial sign failed"})
-		case services.ErrSerializeFailed:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "serialize failed"})
-		case services.ErrBroadcastFailed:
-			c.JSON(http.StatusBadRequest, gin.H{"error": "broadcast failed"})
+		// 提取错误详细信息
+		errorMsg := err.Error()
+
+		// 根据错误类型返回不同的状态码和消息
+		switch {
+		case err == services.ErrInvalidRequest:
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":  "invalid request",
+				"detail": errorMsg,
+			})
+		case err == services.ErrBadTx:
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":  "bad tx",
+				"detail": errorMsg,
+			})
+		case err == services.ErrPartialSignFailed:
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":  "partial sign failed",
+				"detail": errorMsg,
+			})
+		case err == services.ErrSerializeFailed:
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":  "serialize failed",
+				"detail": errorMsg,
+			})
+		case err == services.ErrBroadcastFailed:
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":  "broadcast failed",
+				"detail": errorMsg,
+			})
 		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":  err.Error(),
+				"detail": errorMsg,
+			})
 		}
 		return
 	}
@@ -93,9 +118,17 @@ func RefundHandler(c *gin.Context) {
 		case services.ErrSerializeFailed:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "serialize failed"})
 		case services.ErrBroadcastFailed:
-			c.JSON(http.StatusBadRequest, gin.H{"error": "broadcast failed"})
+			// 返回详细的错误信息
+			errorMsg := err.Error()
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":  "broadcast failed",
+				"detail": errorMsg,
+			})
 		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":  err.Error(),
+				"detail": err.Error(),
+			})
 		}
 		return
 	}

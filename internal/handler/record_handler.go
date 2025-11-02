@@ -32,13 +32,14 @@ func GetPaymentHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"order_id":     tx.OrderID,
-		"status":       tx.Status,
-		"address":      tx.Address,
-		"amount":       tx.Amount,
-		"tx_signature": tx.TXSignature,
-		"block_height": tx.BlockHeight,
-		"created_at":   tx.CreatedAt,
+		"order_id":         tx.OrderID,
+		"status":           tx.Status,
+		"receiver_address": tx.ReceiverAddress, // 收款人地址
+		"sender_address":   tx.SenderAddress,   // 付款人地址
+		"amount":           tx.Amount,
+		"tx_signature":     tx.TXSignature,
+		"block_height":     tx.BlockHeight,
+		"created_at":       tx.CreatedAt,
 	})
 }
 

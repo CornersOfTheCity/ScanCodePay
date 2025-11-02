@@ -4,12 +4,13 @@ import "gorm.io/gorm"
 
 type Transaction struct {
 	gorm.Model
-	OrderID     string `gorm:"uniqueIndex;size:100"` // 订单 ID（从 Memo 提取）
-	Address     string `gorm:"size:44"`              // 收款人地址（从交易中提取）
-	Amount      uint64 // USDC 金额（lamports）
-	TXSignature string `gorm:"size:88"` // 交易签名
-	BlockHeight uint64
-	Status      string `gorm:"size:20;default:'pending'"` // "pending", "confirmed", "failed"
+	OrderID         string `gorm:"uniqueIndex;size:100"` // 订单 ID（从 Memo 提取）
+	ReceiverAddress string `gorm:"size:44"`              // 收款人地址（从交易中提取）
+	SenderAddress   string `gorm:"size:44"`              // 付款人地址（从交易中提取）
+	Amount          uint64 // USDC 金额（lamports）
+	TXSignature     string `gorm:"size:88"` // 交易签名
+	BlockHeight     uint64
+	Status          string `gorm:"size:20;default:'pending'"` // "pending", "confirmed", "failed"
 }
 
 // RefundTransaction 退款交易表
