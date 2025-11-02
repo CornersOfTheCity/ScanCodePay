@@ -2,7 +2,7 @@ package services
 
 import (
 	"context"
-	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -20,20 +20,20 @@ var (
 	Client   *rpc.Client
 	Payer    solana.PrivateKey
 	Refund   solana.PrivateKey // 退款账户私钥
-	USDCmint solana.PublicKey // USDC mint 地址
+	USDCmint solana.PublicKey  // USDC mint 地址
 	// txMutex 用于保护并发交易发送，虽然 Solana 没有 nonce 问题，
 	// 但为了避免 RPC 节点限制和账户余额问题，使用互斥锁确保顺序处理
 	txMutex sync.Mutex
 )
 
 var (
-	ErrInvalidRequest    = errors.New("invalid request")
-	ErrBadTx             = errors.New("bad tx")
-	ErrPartialSignFailed = errors.New("partial sign failed")
-	ErrEncodeFailed      = errors.New("encode failed")
-	ErrSerializeFailed   = errors.New("serialize failed")
-	ErrBroadcastFailed   = errors.New("broadcast failed")
-	ErrOrderNotFound     = errors.New("order not found")
+	ErrInvalidRequest       = errors.New("invalid request")
+	ErrBadTx                = errors.New("bad tx")
+	ErrPartialSignFailed    = errors.New("partial sign failed")
+	ErrEncodeFailed         = errors.New("encode failed")
+	ErrSerializeFailed      = errors.New("serialize failed")
+	ErrBroadcastFailed      = errors.New("broadcast failed")
+	ErrOrderNotFound        = errors.New("order not found")
 	ErrRefundAmountExceeded = errors.New("refund amount exceeded payment amount")
 )
 
@@ -91,7 +91,7 @@ func InitSolana() error {
 func GetPayerAddress() string {
 	var pubkey solana.PublicKey
 	var ok bool
-	
+
 	// 使用匿名函数和 recover 安全地获取公钥
 	func() {
 		defer func() {
@@ -103,7 +103,7 @@ func GetPayerAddress() string {
 		pubkey = Payer.PublicKey()
 		ok = true
 	}()
-	
+
 	if !ok || pubkey.IsZero() {
 		return ""
 	}
@@ -114,7 +114,7 @@ func GetPayerAddress() string {
 func GetRefundAddress() string {
 	var pubkey solana.PublicKey
 	var ok bool
-	
+
 	// 使用匿名函数和 recover 安全地获取公钥
 	func() {
 		defer func() {
@@ -126,7 +126,7 @@ func GetRefundAddress() string {
 		pubkey = Refund.PublicKey()
 		ok = true
 	}()
-	
+
 	if !ok || pubkey.IsZero() {
 		return ""
 	}
@@ -145,7 +145,11 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 	if err != nil {
 		return "", "", ErrBadTx
 	}
-	
+
+	// 记录 RPC 节点信息（用于调试）
+	rpcURL := viper.GetString("solana.rpc_url")
+	fmt.Printf("[DEBUG] 当前使用的 RPC 节点: %s\n", rpcURL)
+
 	// 调试日志：检查交易状态
 	fmt.Printf("[DEBUG] 反序列化后的交易状态:\n")
 	fmt.Printf("  - AccountKeys 数量: %d\n", len(tx.Message.AccountKeys))
@@ -169,7 +173,7 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 
 	// Fee payer 是第一个账户（索引 0）
 	feePayer := tx.Message.AccountKeys[0]
-	
+
 	// 验证 fee payer 必须是服务端账户（因为用户已指定代付 gas 的账户）
 	if !feePayer.Equals(feePayerPubkey) {
 		return "", "", ErrBadTx
@@ -177,7 +181,7 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 
 	// 检查签名状态
 	requiredSigners := int(tx.Message.Header.NumRequiredSignatures)
-	
+
 	// 确保 Signatures 数组有足够的空间
 	if len(tx.Signatures) < requiredSigners {
 		// 扩展 Signatures 数组
@@ -185,34 +189,35 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 			tx.Signatures = append(tx.Signatures, solana.Signature{})
 		}
 	}
-	
+
 	// 检查 feePayer 是否需要签名（Signatures[0] 对应 feePayer）
 	// feePayer 必须是第一个账户（AccountKeys[0]）
 	needsPayerSigning := len(tx.Signatures) == 0 || tx.Signatures[0].IsZero()
 
 	// 检查 blockhash 是否有效（在签名前检查）
+	// 注意：Solana 节点通常接受 150 个区块内的 blockhash（约 60-90 秒）
+	// 我们不应该在这里就拒绝稍微过期的 blockhash，应该让 RPC 节点来判断
 	currentBh, err := Client.GetLatestBlockhash(ctx, rpc.CommitmentConfirmed)
 	if err != nil {
 		return "", "", ErrBadTx
 	}
-	
-	// 如果 blockhash 为零或已过期，需要更新（但用户签名会失效）
+
+	fmt.Printf("[DEBUG] 当前 RPC 节点返回的最新 blockhash: %s (LastValidBlockHeight: %d)\n",
+		currentBh.Value.Blockhash.String(), currentBh.Context.Slot)
+	fmt.Printf("[DEBUG] 交易中的 blockhash: %s\n", tx.Message.RecentBlockhash.String())
+
+	// 如果 blockhash 为零，更新为最新（这种情况下交易本身可能有问题，但尝试修复）
 	if tx.Message.RecentBlockhash.IsZero() {
 		tx.Message.RecentBlockhash = currentBh.Value.Blockhash
 		fmt.Printf("[DEBUG] Blockhash 为零，更新为最新: %s\n", currentBh.Value.Blockhash.String())
 	} else if tx.Message.RecentBlockhash != currentBh.Value.Blockhash {
-		// Blockhash 已过期，但用户签名基于旧的 blockhash
-		// 我们不能在这里更新 blockhash，因为用户的签名会失效
-		// Solana 节点通常接受 150 个区块内的 blockhash（约 60-90 秒）
-		// 如果 blockhash 过期太严重，用户需要重新构造交易
-		fmt.Printf("[DEBUG] Blockhash 已过期（交易中: %s, 当前: %s）\n", 
+		// Blockhash 不同于当前最新的，但不一定是过期的
+		// Solana 节点通常接受 150 个区块内的 blockhash，让 RPC 节点来判断
+		// 我们保留原 blockhash，继续处理交易
+		fmt.Printf("[DEBUG] Blockhash 不同于当前最新（交易中: %s, 当前: %s），但继续尝试广播（Solana 节点会判断是否接受）\n",
 			tx.Message.RecentBlockhash.String(), currentBh.Value.Blockhash.String())
-		
-		// 重要：Blockhash 过期会导致签名验证失败
-		// 我们不能更新 blockhash，因为用户签名会失效
-		// 返回明确的错误，要求前端重新构造交易
-		return "", "", fmt.Errorf("%w: blockhash 已过期（交易中: %s, 当前: %s）。用户的签名基于旧的 blockhash，无法更新。请在前端使用最新 blockhash 重新构造交易并签名后再发送", 
-			ErrBadTx, tx.Message.RecentBlockhash.String(), currentBh.Value.Blockhash.String())
+		// 注意：我们不更新 blockhash，因为用户签名基于旧的 blockhash
+		// 如果 blockhash 真的过期，RPC 节点会在广播时返回错误
 	}
 
 	// 如果需要 feePayer 签名，添加服务端签名
@@ -220,14 +225,14 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 		// 尝试使用 tx.Sign() 方法进行部分签名
 		// 关键：需要先验证用户的签名是否有效（基于当前消息）
 		// 如果用户签名无效，整个交易会失败
-		
+
 		// 保存用户的签名（如果存在）
 		savedUserSig := solana.Signature{}
 		if len(tx.Signatures) > 1 && !tx.Signatures[1].IsZero() {
 			savedUserSig = tx.Signatures[1]
 			fmt.Printf("[DEBUG] 保存用户签名: %s\n", savedUserSig.String())
 		}
-		
+
 		// 使用 tx.Sign() 方法，但只为 feePayer 提供私钥
 		// 注意：如果用户的签名已经有效，tx.Sign() 应该能够识别并保留它
 		signResult, err := tx.Sign(func(pk solana.PublicKey) *solana.PrivateKey {
@@ -239,23 +244,26 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 			// 如果用户已经签名，签名应该已经存在于 Signatures 数组中
 			return nil
 		})
-		
+
 		if err != nil {
 			fmt.Printf("[DEBUG] tx.Sign() 失败: %v\n", err)
-			
+
 			// 如果 tx.Sign() 失败，尝试手动签名作为回退方案
+			// 注意：Solana 交易签名是对消息的序列化字节直接进行 Ed25519 签名
+			// Ed25519.Sign() 方法内部会对消息进行 SHA-512 哈希，我们不需要手动做 SHA256
 			fmt.Printf("[DEBUG] 尝试手动签名作为回退方案...\n")
 			messageBytes, err2 := tx.Message.MarshalBinary()
 			if err2 != nil {
 				return "", "", fmt.Errorf("%w: 序列化消息失败: %v", ErrPartialSignFailed, err2)
 			}
-			
-			messageHash := sha256.Sum256(messageBytes)
-			feePayerSig, err2 := Payer.Sign(messageHash[:])
+
+			// Solana Ed25519 签名：直接对消息字节进行签名（Ed25519 内部会处理哈希）
+			// 注意：Payer.Sign() 使用的是 Ed25519 签名，不是 SHA256 + 签名
+			feePayerSig, err2 := Payer.Sign(messageBytes)
 			if err2 != nil {
 				return "", "", fmt.Errorf("%w: feePayer 手动签名失败: %v (tx.Sign 错误: %v)", ErrPartialSignFailed, err2, err)
 			}
-			
+
 			tx.Signatures[0] = feePayerSig
 			// 恢复用户签名
 			if !savedUserSig.IsZero() {
@@ -274,7 +282,7 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 				}
 			}
 		}
-		
+
 		// 调试日志：检查签名后的状态
 		fmt.Printf("[DEBUG] feePayer 签名后状态:\n")
 		fmt.Printf("  - Blockhash: %s\n", tx.Message.RecentBlockhash.String())
@@ -299,10 +307,10 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 	if err != nil {
 		return "", "", ErrBadTx
 	}
-	
+
 	// 仅记录 blockhash 状态，不更新
 	if tx.Message.RecentBlockhash != bh.Value.Blockhash {
-		fmt.Printf("[DEBUG] 警告: Blockhash 已变化（交易中: %s, 当前: %s），但保留原 blockhash 以保持签名有效\n", 
+		fmt.Printf("[DEBUG] 警告: Blockhash 已变化（交易中: %s, 当前: %s），但保留原 blockhash 以保持签名有效\n",
 			tx.Message.RecentBlockhash.String(), bh.Value.Blockhash.String())
 	}
 
@@ -312,7 +320,7 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 	for i, sig := range tx.Signatures {
 		fmt.Printf("  - Signature[%d]: %s (IsZero: %v)\n", i, sig.String(), sig.IsZero())
 	}
-	
+
 	// 序列化交易
 	enc, err := tx.MarshalBinary()
 	if err != nil {
@@ -321,35 +329,72 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 	fmt.Printf("[DEBUG] 序列化成功，交易大小: %d 字节\n", len(enc))
 
 	// 广播交易（带重试机制）
+	// 参考 SolanaRelayService 的实现：使用 skipPreflight: true 跳过预检
+	// 这样可以避免 blockhash 验证问题（即使 blockhash 稍微过期，只要在链上有效就可以接受）
+	// 注意：gagliardetto/solana-go 的 SendRawTransaction 不支持 skipPreflight 选项
+	// 我们需要使用底层 RPC 调用来实现这个功能
 	var sig solana.Signature
 	var broadcastErr error
 	maxRetries := 3
+	blockhashNotFound := false
+
+	// 参考 SolanaRelayService：如果 blockhash 已过期，重试不会有效，应该直接返回错误
 	for i := 0; i < maxRetries; i++ {
-		fmt.Printf("[DEBUG] 尝试广播交易 (尝试 %d/%d)...\n", i+1, maxRetries)
-		sig, broadcastErr = Client.SendRawTransaction(ctx, enc)
+		fmt.Printf("[DEBUG] 尝试广播交易 (尝试 %d/%d，使用 skipPreflight: true)...\n", i+1, maxRetries)
+
+		// 参考 SolanaRelayService：使用 skipPreflight: true 跳过预检
+		// 这允许即使 blockhash 稍微过期（在150个区块内）的交易也能被接受
+		// 使用底层 RPC 调用发送交易，支持 skipPreflight 选项
+		// 注意：Solana RPC 的 sendTransaction 接受 base64 编码的字符串
+		encBase64 := base64.StdEncoding.EncodeToString(enc)
+		broadcastErr = Client.RPCCallForInto(ctx, &sig, "sendTransaction", []interface{}{
+			encBase64, // base64 编码的字符串
+			map[string]interface{}{
+				"skipPreflight":       true,        // 跳过预检（关键！）
+				"preflightCommitment": "confirmed", // 预检承诺级别
+				"encoding":            "base64",    // 编码格式
+			},
+		})
+
 		if broadcastErr == nil {
 			fmt.Printf("[DEBUG] 广播成功！交易签名: %s\n", sig.String())
 			break
 		}
+
 		fmt.Printf("[DEBUG] 广播失败 (尝试 %d/%d): %v\n", i+1, maxRetries, broadcastErr)
-		// 如果不是最后一个重试，可以添加短暂延迟后重试
+
+		// 检查是否是 "Blockhash not found" 错误
+		// 参考 SolanaRelayService 的实现逻辑：如果是 blockhash 过期，直接返回，不重试
+		errStr := broadcastErr.Error()
+		if strings.Contains(errStr, "Blockhash not found") || strings.Contains(errStr, "BlockhashNotFound") {
+			blockhashNotFound = true
+			fmt.Printf("[DEBUG] 检测到 Blockhash 已过期（类似 SolanaRelayService 的行为：停止重试并返回错误）\n")
+			break
+		}
+
+		// 对于其他错误（如网络错误、账户余额不足等），继续重试
 		// 注意：Solana 交易失败通常很快，不需要长时间等待
 	}
 
 	if broadcastErr != nil {
 		// 提供更详细的错误信息
 		errorDetail := fmt.Sprintf("广播失败: %v", broadcastErr)
-		
-		// Solana RPC 错误通常包含详细信息的字符串
-		// 尝试提取更多错误细节
-		errorDetail += fmt.Sprintf(" | 重试次数: %d/%d", maxRetries, maxRetries)
-		
-		// 如果是签名验证失败，提供更友好的提示
+
+		// 根据不同的错误类型提供更友好的提示
 		errStr := broadcastErr.Error()
-		if strings.Contains(errStr, "signature verification failure") {
-			errorDetail += " | 提示: 签名验证失败，可能原因：1) blockhash 已过期，请在前端使用最新 blockhash 重新构造交易并签名；2) 用户签名无效；3) 手动签名格式不正确"
+		if blockhashNotFound || strings.Contains(errStr, "Blockhash not found") || strings.Contains(errStr, "BlockhashNotFound") {
+			// Blockhash 已过期，这是最常见的问题
+			// 可能原因：
+			// 1. 构造交易时使用的 blockhash 在用户签名和广播之间已过期
+			// 2. SolanaRelayService 使用的 blockhash 已经过期（超过150个区块，约60-90秒）
+			// 3. 用户签名过程耗时过长，导致 blockhash 过期
+			errorDetail = fmt.Sprintf("blockhash 已过期或不存在（交易中的 blockhash: %s，当前 RPC 节点: %s）。解决方案：请在前端重新调用 SolanaRelayService 的构造交易接口获取最新的 blockhash，然后重新构造交易并签名，再调用 signTx 接口", tx.Message.RecentBlockhash.String(), rpcURL)
+		} else if strings.Contains(errStr, "signature verification failure") {
+			errorDetail = "签名验证失败，可能原因：1) blockhash 已过期（请重新获取最新 blockhash 并重新签名）；2) 用户签名无效；3) 交易格式不正确"
+		} else {
+			errorDetail += fmt.Sprintf(" | 重试次数: %d/%d", maxRetries, maxRetries)
 		}
-		
+
 		fmt.Printf("[DEBUG] 最终广播失败: %s\n", errorDetail)
 		return "", "", fmt.Errorf("%w: %s", ErrBroadcastFailed, errorDetail)
 	}
@@ -391,7 +436,7 @@ func BroadcastTx(ctx context.Context, serializedTx string) (string, error) {
 // 返回交易签名和 explorer URL
 func CreateRefundTx(ctx context.Context, orderID, refundTo string, refundAmount uint64) (string, string, error) {
 	fmt.Printf("[DEBUG] CreateRefundTx 调用: orderID=%s, refundTo=%s, refundAmount=%d\n", orderID, refundTo, refundAmount)
-	
+
 	// 验证参数
 	if orderID == "" || refundTo == "" || refundAmount == 0 {
 		fmt.Printf("[DEBUG] 参数验证失败: orderID 为空或 refundTo 为空或 refundAmount 为 0\n")
@@ -461,21 +506,21 @@ func CreateRefundTx(ctx context.Context, orderID, refundTo string, refundAmount 
 	// 构建 USDC 转账指令（使用 Token Program）
 	// Token Program ID: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
 	tokenProgramID := solana.MustPublicKeyFromBase58("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-	
+
 	// Token Transfer 指令格式：
 	// instruction discriminator: 3 (Transfer)
 	// amount: 8 bytes (uint64, little-endian)
 	amountBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint64(amountBytes, refundAmount)
 	transferData := append([]byte{3}, amountBytes...)
-	
+
 	// 构建账户列表
 	accounts := solana.AccountMetaSlice{
 		{PublicKey: sourceTokenAccount, IsSigner: false, IsWritable: true}, // Source
 		{PublicKey: destTokenAccount, IsSigner: false, IsWritable: true},   // Destination
 		{PublicKey: refundPubkey, IsSigner: true, IsWritable: false},       // Owner (authority)
 	}
-	
+
 	// 创建转账指令
 	transferInstruction := solana.NewInstruction(
 		tokenProgramID,
@@ -552,15 +597,15 @@ func CreateRefundTx(ctx context.Context, orderID, refundTo string, refundAmount 
 			return "", "", errors.New("failed to get latest blockhash before broadcast")
 		}
 	}
-	
+
 	// 如果 blockhash 已变化，需要更新并重新签名
 	if tx.Message.RecentBlockhash != currentBh.Value.Blockhash {
-		fmt.Printf("[DEBUG] Blockhash 已变化（交易中: %s, 当前: %s），更新并重新签名\n", 
+		fmt.Printf("[DEBUG] Blockhash 已变化（交易中: %s, 当前: %s），更新并重新签名\n",
 			tx.Message.RecentBlockhash.String(), currentBh.Value.Blockhash.String())
-		
+
 		// 更新 blockhash
 		tx.Message.RecentBlockhash = currentBh.Value.Blockhash
-		
+
 		// 重新签名交易
 		_, err = tx.Sign(func(pk solana.PublicKey) *solana.PrivateKey {
 			if pk.Equals(refundPubkey) {
@@ -581,7 +626,7 @@ func CreateRefundTx(ctx context.Context, orderID, refundTo string, refundAmount 
 		for i, sig := range tx.Signatures {
 			fmt.Printf("[DEBUG] 重新签名后 Signature[%d]: %s (IsZero: %v)\n", i, sig.String(), sig.IsZero())
 		}
-		
+
 		// 重新序列化交易
 		enc, err = tx.MarshalBinary()
 		if err != nil {
@@ -610,10 +655,10 @@ func CreateRefundTx(ctx context.Context, orderID, refundTo string, refundAmount 
 			}
 			if err2 == nil {
 				if tx.Message.RecentBlockhash != retryBh.Value.Blockhash {
-					fmt.Printf("[DEBUG] 更新 blockhash 从 %s 到 %s\n", 
+					fmt.Printf("[DEBUG] 更新 blockhash 从 %s 到 %s\n",
 						tx.Message.RecentBlockhash.String(), retryBh.Value.Blockhash.String())
 					tx.Message.RecentBlockhash = retryBh.Value.Blockhash
-					
+
 					// 重新签名
 					_, err2 = tx.Sign(func(pk solana.PublicKey) *solana.PrivateKey {
 						if pk.Equals(refundPubkey) {
@@ -630,7 +675,7 @@ func CreateRefundTx(ctx context.Context, orderID, refundTo string, refundAmount 
 					} else {
 						fmt.Printf("[DEBUG] 重试前重新签名成功，签名数量: %d\n", len(tx.Signatures))
 					}
-					
+
 					// 重新序列化
 					enc, err2 = tx.MarshalBinary()
 					if err2 != nil {
@@ -647,7 +692,7 @@ func CreateRefundTx(ctx context.Context, orderID, refundTo string, refundAmount 
 				fmt.Printf("[DEBUG] 重试前获取 blockhash 失败: %v\n", err2)
 			}
 		}
-		
+
 		fmt.Printf("[DEBUG] 尝试广播退款交易 (尝试 %d/%d, blockhash: %s)...\n", i+1, maxRetries, tx.Message.RecentBlockhash.String())
 		sig, broadcastErr = Client.SendRawTransaction(ctx, enc)
 		if broadcastErr == nil {
@@ -656,18 +701,18 @@ func CreateRefundTx(ctx context.Context, orderID, refundTo string, refundAmount 
 		}
 		fmt.Printf("[DEBUG] 退款交易广播失败 (尝试 %d/%d): %v\n", i+1, maxRetries, broadcastErr)
 	}
-	
+
 	if broadcastErr != nil {
 		// 提供更详细的错误信息
 		errorDetail := fmt.Sprintf("广播失败: %v", broadcastErr)
 		errorDetail += fmt.Sprintf(" | 重试次数: %d/%d", maxRetries, maxRetries)
-		
+
 		// 检查是否是签名验证失败
 		errStr := broadcastErr.Error()
 		if strings.Contains(errStr, "signature verification failure") {
 			errorDetail += " | 提示: 签名验证失败"
 		}
-		
+
 		fmt.Printf("[DEBUG] 最终广播失败: %s\n", errorDetail)
 		return "", "", fmt.Errorf("%w: %s", ErrBroadcastFailed, errorDetail)
 	}

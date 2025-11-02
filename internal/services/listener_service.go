@@ -209,7 +209,8 @@ func (l *Listener) subscribeLogs(payerPubkey solana.PublicKey) error {
 	// 1. 直接订阅日志，无需轮询账户变化
 	// 2. 实时捕获所有包含该地址的交易
 	// 3. 减少RPC调用（只在收到通知时获取交易详情）
-	sub, err := l.wsClient.LogsSubscribeMentions(payerPubkey, rpc.CommitmentFinalized)
+	// 使用 CommitmentConfirmed 而不是 Finalized，可以大幅减少延迟（从 12-15秒降到 400ms-1秒）
+	sub, err := l.wsClient.LogsSubscribeMentions(payerPubkey, rpc.CommitmentConfirmed)
 	if err != nil {
 		return fmt.Errorf("订阅日志失败: %w", err)
 	}
@@ -236,7 +237,7 @@ func (l *Listener) handleLogsNotifications() {
 
 			// 重新订阅
 			l.mu.Lock()
-			newSub, err := l.wsClient.LogsSubscribeMentions(payerPubkey, rpc.CommitmentFinalized)
+			newSub, err := l.wsClient.LogsSubscribeMentions(payerPubkey, rpc.CommitmentConfirmed)
 			if err != nil {
 				l.mu.Unlock()
 				retryCount++
@@ -304,11 +305,19 @@ func (l *Listener) processSignature(sigInfo *rpc.TransactionSignature, address s
 	var tx *rpc.GetTransactionResult
 	var err error
 
-	// 性能优化：直接使用base64编码（更快，避免两次RPC调用）
-	// 如果需要Owner信息，base64编码时可能为空，但可以通过TokenBalances计算得出
+	// 性能优化：直接使用jsonParsed编码（避免后续重复调用，虽然单次可能稍慢，但总时间更短）
+	// 使用 CommitmentConfirmed 而不是默认的 Finalized，可以减少等待时间
 	tx, err = l.client.GetTransaction(l.ctx, sigInfo.Signature, &rpc.GetTransactionOpts{
-		Encoding: solana.EncodingBase64,
+		Encoding:   solana.EncodingJSONParsed,
+		Commitment: rpc.CommitmentConfirmed,
 	})
+	if err != nil || tx == nil {
+		// 如果jsonParsed失败，回退到base64
+		tx, err = l.client.GetTransaction(l.ctx, sigInfo.Signature, &rpc.GetTransactionOpts{
+			Encoding:   solana.EncodingBase64,
+			Commitment: rpc.CommitmentConfirmed,
+		})
+	}
 	if err != nil || tx == nil {
 		return err // 静默失败（性能优化）
 	}
@@ -467,24 +476,13 @@ func (l *Listener) extractUSDCTransfer(tx *rpc.GetTransactionResult, signature s
 	log.Printf("[DEBUG] PreTokenBalances数量: %d, PostTokenBalances数量: %d",
 		len(tx.Meta.PreTokenBalances), len(tx.Meta.PostTokenBalances))
 
-	// 如果没有TokenBalances，尝试使用jsonParsed编码重新获取
+	// 注意：processSignature 已经优先使用 jsonParsed 编码获取交易，所以这里应该已经有完整信息
+	// 如果 TokenBalances 仍然为空，可能是交易确实不包含 Token 操作，直接返回错误
 	if len(tx.Meta.PreTokenBalances) == 0 && len(tx.Meta.PostTokenBalances) == 0 {
-		log.Printf("[DEBUG] TokenBalances为空，尝试使用jsonParsed编码重新获取")
-		// 尝试使用jsonParsed编码重新获取交易详情
-		txParsed, err := l.client.GetTransaction(l.ctx, signature, &rpc.GetTransactionOpts{
-			Encoding: solana.EncodingJSONParsed,
-		})
-		if err == nil && txParsed != nil && txParsed.Meta != nil {
-			// 使用jsonParsed的结果
-			tx.Meta = txParsed.Meta
-			log.Printf("[DEBUG] 使用jsonParsed编码，PreTokenBalances数量: %d, PostTokenBalances数量: %d",
-				len(tx.Meta.PreTokenBalances), len(tx.Meta.PostTokenBalances))
-		} else {
-			log.Printf("[DEBUG] jsonParsed编码获取失败: %v", err)
-		}
+		return nil, fmt.Errorf("交易没有 TokenBalances（可能不是 Token 转账交易）")
 	}
 
-	// 如果TokenBalances中没有Owner信息，尝试使用jsonParsed编码重新获取
+	// 检查是否有 Owner 信息（jsonParsed 应该包含，但如果使用 base64 回退可能没有）
 	hasOwnerInfo := false
 	for _, post := range tx.Meta.PostTokenBalances {
 		if post.Mint == l.mintPubkey && post.Owner != nil {
@@ -494,14 +492,8 @@ func (l *Listener) extractUSDCTransfer(tx *rpc.GetTransactionResult, signature s
 	}
 
 	if !hasOwnerInfo {
-		// base64编码可能没有Owner信息，尝试使用jsonParsed编码
-		txParsed, err := l.client.GetTransaction(l.ctx, signature, &rpc.GetTransactionOpts{
-			Encoding: solana.EncodingJSONParsed,
-		})
-		if err == nil && txParsed != nil && txParsed.Meta != nil {
-			// 使用jsonParsed的结果（包含Owner信息）
-			tx.Meta = txParsed.Meta
-		}
+		// 如果 base64 回退后仍然没有 Owner 信息，这是异常情况，记录日志
+		log.Printf("[WARN] TokenBalances 中没有 Owner 信息，这可能导致无法识别发送方和接收方")
 	}
 
 	// 遍历所有PostTokenBalances，查找USDC余额增加的账户
