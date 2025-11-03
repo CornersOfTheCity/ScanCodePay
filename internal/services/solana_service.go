@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
@@ -221,74 +222,34 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 	}
 
 	// 如果需要 feePayer 签名，添加服务端签名
+	// 注意：用户已经完成签名，我们只需要手动签名 feePayer 即可
+	// 这与 CreateRefundTx 不同：CreateRefundTx 需要为两个账户签名，所以使用 tx.Sign()
+	// 而这里只需要部分签名（feePayer），直接手动签名更简单可靠
 	if needsPayerSigning {
-		// 尝试使用 tx.Sign() 方法进行部分签名
-		// 关键：需要先验证用户的签名是否有效（基于当前消息）
-		// 如果用户签名无效，整个交易会失败
+		fmt.Printf("[DEBUG] 开始为 feePayer %s 手动签名（用户已签名，只需 feePayer 签名）...\n", feePayerPubkey.String())
 
-		// 保存用户的签名（如果存在）
-		savedUserSig := solana.Signature{}
-		if len(tx.Signatures) > 1 && !tx.Signatures[1].IsZero() {
-			savedUserSig = tx.Signatures[1]
-			fmt.Printf("[DEBUG] 保存用户签名: %s\n", savedUserSig.String())
-		}
-
-		// 使用 tx.Sign() 方法，但只为 feePayer 提供私钥
-		// 注意：如果用户的签名已经有效，tx.Sign() 应该能够识别并保留它
-		signResult, err := tx.Sign(func(pk solana.PublicKey) *solana.PrivateKey {
-			if pk.Equals(feePayerPubkey) {
-				fmt.Printf("[DEBUG] 为 feePayer %s 提供私钥进行签名\n", pk.String())
-				return &Payer
-			}
-			// 对于其他签名者，返回 nil
-			// 如果用户已经签名，签名应该已经存在于 Signatures 数组中
-			return nil
-		})
-
+		// 序列化交易消息（所有签名者都需要对相同的消息签名）
+		messageBytes, err := tx.Message.MarshalBinary()
 		if err != nil {
-			fmt.Printf("[DEBUG] tx.Sign() 失败: %v\n", err)
-
-			// 如果 tx.Sign() 失败，尝试手动签名作为回退方案
-			// 注意：Solana 交易签名是对消息的序列化字节直接进行 Ed25519 签名
-			// Ed25519.Sign() 方法内部会对消息进行 SHA-512 哈希，我们不需要手动做 SHA256
-			fmt.Printf("[DEBUG] 尝试手动签名作为回退方案...\n")
-			messageBytes, err2 := tx.Message.MarshalBinary()
-			if err2 != nil {
-				return "", "", fmt.Errorf("%w: 序列化消息失败: %v", ErrPartialSignFailed, err2)
-			}
-
-			// Solana Ed25519 签名：直接对消息字节进行签名（Ed25519 内部会处理哈希）
-			// 注意：Payer.Sign() 使用的是 Ed25519 签名，不是 SHA256 + 签名
-			feePayerSig, err2 := Payer.Sign(messageBytes)
-			if err2 != nil {
-				return "", "", fmt.Errorf("%w: feePayer 手动签名失败: %v (tx.Sign 错误: %v)", ErrPartialSignFailed, err2, err)
-			}
-
-			tx.Signatures[0] = feePayerSig
-			// 恢复用户签名
-			if !savedUserSig.IsZero() {
-				tx.Signatures[1] = savedUserSig
-			}
-		} else {
-			fmt.Printf("[DEBUG] tx.Sign() 成功，返回 %d 个签名\n", len(signResult))
-			// 检查用户签名是否被保留
-			if !savedUserSig.IsZero() && len(tx.Signatures) > 1 {
-				if tx.Signatures[1].IsZero() {
-					fmt.Printf("[DEBUG] 警告: 用户签名被清除，尝试恢复...\n")
-					tx.Signatures[1] = savedUserSig
-				} else if tx.Signatures[1].String() != savedUserSig.String() {
-					fmt.Printf("[DEBUG] 警告: 用户签名发生变化，使用保存的签名\n")
-					tx.Signatures[1] = savedUserSig
-				}
-			}
+			return "", "", fmt.Errorf("%w: 序列化消息失败: %v", ErrPartialSignFailed, err)
 		}
+
+		// 使用 feePayer 私钥对消息进行签名（Ed25519 内部会处理哈希）
+		feePayerSig, err := Payer.Sign(messageBytes)
+		if err != nil {
+			return "", "", fmt.Errorf("%w: feePayer 签名失败: %v", ErrPartialSignFailed, err)
+		}
+
+		// 将 feePayer 签名放入 Signature[0]（feePayer 是第一个账户）
+		tx.Signatures[0] = feePayerSig
+		fmt.Printf("[DEBUG] feePayer 签名成功: %s\n", feePayerSig.String())
 
 		// 调试日志：检查签名后的状态
 		fmt.Printf("[DEBUG] feePayer 签名后状态:\n")
 		fmt.Printf("  - Blockhash: %s\n", tx.Message.RecentBlockhash.String())
 		fmt.Printf("  - FeePayer Signature[0]: %s (IsZero: %v)\n", tx.Signatures[0].String(), tx.Signatures[0].IsZero())
-		if len(tx.Signatures) > 1 {
-			fmt.Printf("  - User Signature[1]: %s (IsZero: %v)\n", tx.Signatures[1].String(), tx.Signatures[1].IsZero())
+		for i := 1; i < len(tx.Signatures); i++ {
+			fmt.Printf("  - User Signature[%d]: %s (IsZero: %v)\n", i, tx.Signatures[i].String(), tx.Signatures[i].IsZero())
 		}
 	}
 
@@ -343,7 +304,6 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 		fmt.Printf("[DEBUG] 尝试广播交易 (尝试 %d/%d，使用 skipPreflight: true)...\n", i+1, maxRetries)
 
 		// 参考 SolanaRelayService：使用 skipPreflight: true 跳过预检
-		// 这允许即使 blockhash 稍微过期（在150个区块内）的交易也能被接受
 		// 使用底层 RPC 调用发送交易，支持 skipPreflight 选项
 		// 注意：Solana RPC 的 sendTransaction 接受 base64 编码的字符串
 		encBase64 := base64.StdEncoding.EncodeToString(enc)
@@ -357,6 +317,45 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 		})
 
 		if broadcastErr == nil {
+			// 验证返回的签名是否有效（不为零）
+			if sig.IsZero() {
+				fmt.Printf("[DEBUG] 警告: 广播返回的签名为零，交易可能未提交\n")
+				broadcastErr = fmt.Errorf("广播返回的签名为零")
+				continue
+			}
+
+			fmt.Printf("[DEBUG] 广播返回交易签名: %s（验证是否真的上链）\n", sig.String())
+
+			// 验证交易是否真的在链上（快速检查）
+			// 注意：刚广播的交易可能还在 pending 状态，但至少应该能被查询到
+			statuses, checkErr := Client.GetSignatureStatuses(ctx, false, sig)
+			if checkErr != nil {
+				fmt.Printf("[DEBUG] 警告: 无法验证交易状态: %v\n", checkErr)
+				broadcastErr = fmt.Errorf("无法验证交易状态: %v", checkErr)
+				continue
+			}
+
+			if statuses == nil || len(statuses.Value) == 0 || statuses.Value[0] == nil {
+				fmt.Printf("[DEBUG] 警告: 交易签名无法查询，可能未提交到链上（等待 2 秒后重试）\n")
+				// 等待一小段时间后重试验证
+				time.Sleep(2 * time.Second)
+				statuses2, checkErr2 := Client.GetSignatureStatuses(ctx, false, sig)
+				if checkErr2 != nil || statuses2 == nil || len(statuses2.Value) == 0 || statuses2.Value[0] == nil {
+					fmt.Printf("[DEBUG] 错误: 重试后仍无法查询交易，交易未提交到链上\n")
+					broadcastErr = fmt.Errorf("交易签名无法查询，可能未提交到链上")
+					continue
+				}
+				statuses = statuses2
+			}
+
+			// 检查交易状态
+			if statuses.Value[0].Err != nil {
+				fmt.Printf("[DEBUG] 错误: 交易已提交但执行失败: %v\n", statuses.Value[0].Err)
+				broadcastErr = fmt.Errorf("交易提交失败: %v", statuses.Value[0].Err)
+				continue
+			}
+
+			fmt.Printf("[DEBUG] 交易状态验证成功: 已确认存在，ConfirmationStatus: %v\n", statuses.Value[0].ConfirmationStatus)
 			fmt.Printf("[DEBUG] 广播成功！交易签名: %s\n", sig.String())
 			break
 		}
