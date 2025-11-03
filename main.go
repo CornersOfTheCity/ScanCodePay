@@ -94,21 +94,34 @@ func main() {
 		localAPI := api.Group("")
 		localAPI.Use(middleware.LocalOnly())
 		{
-			// 收款交易查询（通过订单ID）
-			localAPI.GET("/payment/:orderId", handler.GetPaymentHandler)
+			// // 收款交易查询（通过订单ID）
+			// localAPI.GET("/payment/:orderId", handler.GetPaymentHandler)
 
-			// 退款交易查询（通过订单ID，支持原订单ID或交易签名）
-			localAPI.GET("/refund/:orderId", handler.GetRefundHandler)
+			// // 退款交易查询（通过订单ID，支持原订单ID或交易签名）
+			// localAPI.GET("/refund/:orderId", handler.GetRefundHandler)
 
-			// 签名账户地址查询
-			localAPI.GET("/getPayerAddress", handler.GetPayerAddressHandler)
+			// // 签名账户地址查询
+			// localAPI.GET("/getPayerAddress", handler.GetPayerAddressHandler)
 
-			// 退款接口
-			localAPI.POST("/refund", handler.RefundHandler)
+			// // 退款接口
+			// localAPI.POST("/refund", handler.RefundHandler)
 		}
 
 		// 签名接口（无需本地限制，可外部调用）
 		api.POST("/signTx", handler.SignTxHandler)
+
+		//测试环境先打开
+		// 收款交易查询（通过订单ID）
+		api.GET("/payment/:orderId", handler.GetPaymentHandler)
+
+		// 退款交易查询（通过订单ID，支持原订单ID或交易签名）
+		api.GET("/refund/:orderId", handler.GetRefundHandler)
+
+		// 签名账户地址查询
+		api.GET("/getPayerAddress", handler.GetPayerAddressHandler)
+
+		// 退款接口
+		api.POST("/refund", handler.RefundHandler)
 	}
 
 	// 启动服务器
