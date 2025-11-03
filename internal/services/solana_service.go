@@ -405,29 +405,29 @@ func SignTx(ctx context.Context, serializedTx string) (string, string, error) {
 	return signature, explorerURL, nil
 }
 
-// BroadcastTx: send raw tx to chain and return signature
-func BroadcastTx(ctx context.Context, serializedTx string) (string, error) {
-	if serializedTx == "" {
-		return "", ErrInvalidRequest
-	}
+// // BroadcastTx: send raw tx to chain and return signature
+// func BroadcastTx(ctx context.Context, serializedTx string) (string, error) {
+// 	if serializedTx == "" {
+// 		return "", ErrInvalidRequest
+// 	}
 
-	tx, err := utils.DecodeBase64Tx(serializedTx)
-	if err != nil {
-		return "", ErrBadTx
-	}
+// 	tx, err := utils.DecodeBase64Tx(serializedTx)
+// 	if err != nil {
+// 		return "", ErrBadTx
+// 	}
 
-	enc, err := tx.MarshalBinary()
-	if err != nil {
-		return "", ErrSerializeFailed
-	}
+// 	enc, err := tx.MarshalBinary()
+// 	if err != nil {
+// 		return "", ErrSerializeFailed
+// 	}
 
-	sig, err := Client.SendRawTransaction(ctx, enc)
-	if err != nil {
-		return "", ErrBroadcastFailed
-	}
+// 	sig, err := Client.SendRawTransaction(ctx, enc)
+// 	if err != nil {
+// 		return "", ErrBroadcastFailed
+// 	}
 
-	return sig.String(), nil
-}
+// 	return sig.String(), nil
+// }
 
 // CreateRefundTx 创建退款交易并广播
 // orderID: 原收款订单ID
