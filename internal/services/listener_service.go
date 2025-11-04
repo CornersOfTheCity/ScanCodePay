@@ -29,6 +29,9 @@ type Listener struct {
 	// 性能优化：并发控制和缓存
 	processedSignatures sync.Map      // 已处理的交易签名缓存（快速去重）
 	workerPool          chan struct{} // goroutine池，限制并发数
+	// 混合模式：轮询相关
+	lastPolledSlot      uint64        // 上次轮询时的槽位（用于增量轮询）
+	lastPolledSlotMutex sync.RWMutex  // 保护 lastPolledSlot 的并发访问
 }
 
 func ListenerStart(ctx context.Context, dbConn *gorm.DB, rpcURL, wsURL, usdcMint string, syncInterval time.Duration, configStartHeight uint64) {
@@ -87,7 +90,17 @@ func ListenerStart(ctx context.Context, dbConn *gorm.DB, rpcURL, wsURL, usdcMint
 		log.Println("WebSocket 实时监听已启动，开始捕获新交易")
 	}
 
-	// 5. 判断是否需要历史同步，如果需要则在后台并发执行
+	// 5. 启动混合模式：定期轮询作为备份机制（确保不遗漏交易）
+	// 初始化 lastPolledSlot 为当前槽位（从当前位置开始轮询）
+	l.lastPolledSlotMutex.Lock()
+	l.lastPolledSlot = currentSlotUint
+	l.lastPolledSlotMutex.Unlock()
+
+	// 启动定期轮询 goroutine（作为 WebSocket 的备份）
+	log.Printf("启动混合模式：定期轮询（间隔 %v）作为 WebSocket 订阅的备份", syncInterval)
+	go l.startPolling(payerPubkey.String(), syncInterval)
+
+	// 6. 判断是否需要历史同步，如果需要则在后台并发执行
 	// 如果数据库为空且配置的起始高度为0，则只开启订阅，不进行历史同步
 	if dbMaxHeight == 0 && configStartHeight == 0 {
 		log.Println("数据库为空且配置起始高度为0，仅开启订阅，不进行历史同步")
@@ -106,6 +119,12 @@ func ListenerStart(ctx context.Context, dbConn *gorm.DB, rpcURL, wsURL, usdcMint
 				log.Println("警告: 历史同步未完成，可能存在遗漏的交易")
 			} else {
 				log.Printf("历史同步完成: 从槽位 %d 到槽位 %d", syncStartHeight, lastProcessedSlot)
+				// 更新轮询起始槽位，避免重复处理
+				l.lastPolledSlotMutex.Lock()
+				if lastProcessedSlot > l.lastPolledSlot {
+					l.lastPolledSlot = lastProcessedSlot
+				}
+				l.lastPolledSlotMutex.Unlock()
 			}
 		}()
 	} else {
@@ -707,6 +726,125 @@ func (l *Listener) savePaymentTransaction(memo string, sigInfo *rpc.TransactionS
 		txRecord.TXSignature, orderID, transfer.Amount, txRecord.ID)
 	// 成功保存后，将签名存入缓存，避免重复处理
 	l.processedSignatures.Store(txSignature, true)
+	return nil
+}
+
+// startPolling 启动定期轮询（混合模式：作为 WebSocket 订阅的备份）
+// 定期检查新的交易，确保即使 WebSocket 订阅失败也不会遗漏交易
+func (l *Listener) startPolling(address string, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	log.Printf("[混合模式] 定期轮询已启动，间隔: %v", interval)
+
+	for {
+		select {
+		case <-l.ctx.Done():
+			log.Println("[混合模式] 定期轮询已停止")
+			return
+		case <-ticker.C:
+			// 执行轮询
+			if err := l.pollNewTransactions(address); err != nil {
+				log.Printf("[混合模式] 轮询失败: %v", err)
+			}
+		}
+	}
+}
+
+// pollNewTransactions 轮询新的交易（从上次轮询的槽位开始）
+func (l *Listener) pollNewTransactions(address string) error {
+	// 获取当前槽位
+	currentSlot, err := l.client.GetSlot(l.ctx, rpc.CommitmentConfirmed)
+	if err != nil {
+		return fmt.Errorf("获取当前槽位失败: %w", err)
+	}
+	currentSlotUint := uint64(currentSlot)
+
+	// 获取上次轮询的槽位
+	l.lastPolledSlotMutex.RLock()
+	lastPolledSlot := l.lastPolledSlot
+	l.lastPolledSlotMutex.RUnlock()
+
+	// 如果当前槽位没有变化，跳过本次轮询
+	if currentSlotUint <= lastPolledSlot {
+		return nil
+	}
+
+	log.Printf("[混合模式] 开始轮询: 从槽位 %d 到槽位 %d", lastPolledSlot, currentSlotUint)
+
+	addressPubkey := solana.MustPublicKeyFromBase58(address)
+	limit := 100
+	var before solana.Signature
+	hasBefore := false
+	newTransactionsFound := 0
+
+	// 轮询获取最近的交易（从新到旧）
+	for {
+		opts := &rpc.GetSignaturesForAddressOpts{
+			Limit: &limit,
+		}
+		if hasBefore {
+			opts.Before = before
+		}
+
+		signatures, err := l.client.GetSignaturesForAddressWithOpts(l.ctx, addressPubkey, opts)
+		if err != nil || len(signatures) == 0 {
+			break
+		}
+
+		// 处理交易（只处理槽位在 [lastPolledSlot, currentSlotUint] 范围内的）
+		processedAny := false
+		for _, sig := range signatures {
+			sigSlot := uint64(sig.Slot)
+
+			// 如果交易槽位小于 lastPolledSlot，说明已经处理过，停止轮询
+			if sigSlot < lastPolledSlot {
+				goto done
+			}
+
+			// 如果交易槽位大于 currentSlotUint，跳过（可能是未来的交易，不应该存在）
+			if sigSlot > currentSlotUint {
+				continue
+			}
+
+			// 处理交易（使用相同的 processSignatureAsync 函数，自动去重）
+			var blockTime *solana.UnixTimeSeconds
+			if sig.BlockTime != nil {
+				bt := solana.UnixTimeSeconds(*sig.BlockTime)
+				blockTime = &bt
+			}
+			sigInfo := &rpc.TransactionSignature{
+				Signature: sig.Signature,
+				Slot:      sig.Slot,
+				BlockTime: blockTime,
+			}
+
+			// 异步处理（使用相同的去重机制）
+			go l.processSignatureAsync(sigInfo, address)
+			processedAny = true
+			newTransactionsFound++
+		}
+
+		// 如果没有处理任何交易，停止轮询
+		if !processedAny {
+			break
+		}
+
+		// 准备下一次查询（使用最后一个交易的签名作为 before）
+		before = signatures[len(signatures)-1].Signature
+		hasBefore = true
+	}
+
+done:
+	// 更新 lastPolledSlot 为当前槽位
+	l.lastPolledSlotMutex.Lock()
+	l.lastPolledSlot = currentSlotUint
+	l.lastPolledSlotMutex.Unlock()
+
+	if newTransactionsFound > 0 {
+		log.Printf("[混合模式] 轮询完成: 发现 %d 个新交易，已更新轮询槽位到 %d", newTransactionsFound, currentSlotUint)
+	}
+
 	return nil
 }
 
