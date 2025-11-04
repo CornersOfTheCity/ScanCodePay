@@ -12,6 +12,7 @@ import (
 	"ScanCodePay/internal/db"
 	"ScanCodePay/internal/models"
 	"ScanCodePay/internal/services"
+	"ScanCodePay/utils"
 )
 
 // refundRequestCache 防重复请求缓存
@@ -125,7 +126,7 @@ func SignTxHandler(c *gin.Context) {
 	})
 }
 
-// RefundHandler 退款接口（原 broadcastTx 接口）
+// RefundHandler 退款接口
 func RefundHandler(c *gin.Context) {
 	var req struct {
 		OrderID  string `json:"orderId" binding:"required"`  // 原收款订单ID
@@ -142,7 +143,7 @@ func RefundHandler(c *gin.Context) {
 	refundKey := generateRefundKey(req.OrderID, req.RefundTo, req.Amount)
 	if refundCache.checkAndSet(refundKey) {
 		c.JSON(http.StatusTooManyRequests, gin.H{
-			"error": "重复请求",
+			"error":  "重复请求",
 			"detail": "同一笔退款在10秒内只能调用一次，请稍后再试",
 		})
 		return
@@ -208,7 +209,7 @@ func RefundHandler(c *gin.Context) {
 	if err != nil {
 		// 退款失败时，清除缓存，允许重试
 		refundCache.clear(refundKey)
-		
+
 		switch err {
 		case services.ErrInvalidRequest:
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
@@ -270,5 +271,12 @@ func GetPayerAddressHandler(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"address": address,
+	})
+}
+
+// GetVersionHandler 返回服务版本号
+func GetVersionHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"version": utils.Version,
 	})
 }

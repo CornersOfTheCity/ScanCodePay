@@ -16,6 +16,7 @@ import (
 	"ScanCodePay/internal/middleware"
 	"ScanCodePay/internal/models"
 	"ScanCodePay/internal/services"
+	"ScanCodePay/utils"
 )
 
 type Config struct {
@@ -28,7 +29,7 @@ type Config struct {
 	} `mapstructure:"mysql"`
 	Solana struct {
 		RPCURL      string `mapstructure:"rpc_url"`
-		WSURL       string `mapstructure:"ws_url"` // 新增：WebSocket URL，例如 "wss://api.mainnet-beta.solana.com"
+		WSURL       string `mapstructure:"ws_url"`
 		USDC        string `mapstructure:"usdc_mint"`
 		PayerSecret string `mapstructure:"payer_secret"` // 代付款账户私钥（同时用于收款和退款）
 	} `mapstructure:"solana"`
@@ -64,7 +65,7 @@ func main() {
 	// 设置全局 DB 变量
 	db.DB = dbConn
 
-	// 运行表结构迁移（创建新表或更新表结构）
+	// 创建新表
 	if err := dbConn.AutoMigrate(&models.Transaction{}, &models.RefundTransaction{}); err != nil {
 		log.Fatal("表迁移失败:", err)
 	}
@@ -75,7 +76,11 @@ func main() {
 		log.Fatal("初始化 Solana 客户端失败:", err)
 	}
 
+	fmt.Printf("ScanCodePay %s\n", utils.Version)
 	fmt.Println("只监控代付款地址的 USDC 交易")
+
+	// 初始化服务启动时间（用于就绪探针）
+	handler.InitStartTime()
 
 	// 初始化监听器（在后台 goroutine 中运行）
 	// 现在只监控代付款地址（Payer）的 USDC Token Account
@@ -86,6 +91,10 @@ func main() {
 	r := gin.Default()
 	r.Use(gin.Logger())
 	r.Use(gin.Recovery())
+
+	// 健康检查接口（在 /api 之前，直接挂载在根路径）
+	r.GET("/healthz", handler.HealthzHandler)     // 存活探针
+	r.GET("/readiness", handler.ReadinessHandler) // 就绪探针
 
 	// 路由
 	api := r.Group("/api")
@@ -109,6 +118,9 @@ func main() {
 
 		// 签名接口（无需本地限制，可外部调用）
 		api.POST("/signTx", handler.SignTxHandler)
+
+		// 版本查询接口（无需本地限制）
+		api.GET("/version", handler.GetVersionHandler)
 
 		//测试环境先打开
 		// 收款交易查询（通过订单ID）
