@@ -1,7 +1,10 @@
 package handler
 
 import (
+	"fmt"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -10,6 +13,57 @@ import (
 	"ScanCodePay/internal/models"
 	"ScanCodePay/internal/services"
 )
+
+// refundRequestCache 防重复请求缓存
+type refundRequestCache struct {
+	mu      sync.RWMutex
+	entries map[string]time.Time
+}
+
+var refundCache = &refundRequestCache{
+	entries: make(map[string]time.Time),
+}
+
+// generateRefundKey 生成退款请求的唯一键（orderID + refundTo + amount）
+func generateRefundKey(orderID, refundTo string, amount uint64) string {
+	return fmt.Sprintf("%s:%s:%d", orderID, refundTo, amount)
+}
+
+// checkAndSet 检查请求是否在10秒内重复，如果不是则设置
+// 返回 true 表示重复请求，false 表示新请求
+func (c *refundRequestCache) checkAndSet(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 清理过期条目（超过10秒）
+	now := time.Now()
+	for k, t := range c.entries {
+		if now.Sub(t) > 10*time.Second {
+			delete(c.entries, k)
+		}
+	}
+
+	// 检查是否存在
+	if lastTime, exists := c.entries[key]; exists {
+		if now.Sub(lastTime) <= 10*time.Second {
+			return true // 重复请求
+		}
+		// 超过10秒，更新时间为当前时间
+		c.entries[key] = now
+		return false
+	}
+
+	// 新请求，记录时间
+	c.entries[key] = now
+	return false
+}
+
+// clear 清除指定键（退款成功后可以清除，但也可以等自动过期）
+func (c *refundRequestCache) clear(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, key)
+}
 
 func SignTxHandler(c *gin.Context) {
 	var req struct {
@@ -84,6 +138,16 @@ func RefundHandler(c *gin.Context) {
 		return
 	}
 
+	// 防重复请求检查：同一笔退款（orderID + refundTo + amount）在10秒内只能调用一次
+	refundKey := generateRefundKey(req.OrderID, req.RefundTo, req.Amount)
+	if refundCache.checkAndSet(refundKey) {
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"error": "重复请求",
+			"detail": "同一笔退款在10秒内只能调用一次，请稍后再试",
+		})
+		return
+	}
+
 	// 使用全局 DB 连接
 	if db.DB == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "数据库未初始化"})
@@ -142,6 +206,9 @@ func RefundHandler(c *gin.Context) {
 	// 创建退款交易并广播
 	signature, explorerURL, err := services.CreateRefundTx(c.Request.Context(), req.OrderID, req.RefundTo, req.Amount)
 	if err != nil {
+		// 退款失败时，清除缓存，允许重试
+		refundCache.clear(refundKey)
+		
 		switch err {
 		case services.ErrInvalidRequest:
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
@@ -175,9 +242,16 @@ func RefundHandler(c *gin.Context) {
 	}
 
 	if err := db.SaveRefundTransaction(db.DB, refundRecord); err != nil {
+		// 保存失败时，清除缓存，允许重试
+		refundCache.clear(refundKey)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存退款记录失败"})
 		return
 	}
+
+	// 退款成功，清除缓存（允许后续可能的退款）
+	// 注意：也可以不清除，让缓存自动过期（10秒后）
+	// 这里选择清除，以便如果退款失败，用户可以立即重试
+	refundCache.clear(refundKey)
 
 	c.JSON(http.StatusOK, gin.H{
 		"originalOrderID": req.OrderID,
