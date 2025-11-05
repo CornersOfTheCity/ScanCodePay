@@ -9,7 +9,9 @@ solana:
   ws_url: ""
   usdc_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
   payer_secret: "your_payer_secret"  # 代付款账户私钥（base58格式）
-  refund_secret: "your_refund_secret"  # 退款账户私钥（base58格式），用于支付USDC 
+  refund_secret: "your_refund_secret"  # 退款账户私钥（base58格式），用于支付USDC
+  base_priority_fee: 5000  # 基础优先级费用（microlamports per compute unit），默认 5000
+  max_priority_fee: 50000  # 最大优先级费用（microlamports per compute unit），默认 50000 
 app:
   poll_interval: 2  # 历史同步间隔（秒）
   port: 8080

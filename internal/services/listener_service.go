@@ -30,8 +30,8 @@ type Listener struct {
 	processedSignatures sync.Map      // 已处理的交易签名缓存（快速去重）
 	workerPool          chan struct{} // goroutine池，限制并发数
 	// 混合模式：轮询相关
-	lastPolledSlot      uint64        // 上次轮询时的槽位（用于增量轮询）
-	lastPolledSlotMutex sync.RWMutex  // 保护 lastPolledSlot 的并发访问
+	lastPolledSlot      uint64       // 上次轮询时的槽位（用于增量轮询）
+	lastPolledSlotMutex sync.RWMutex // 保护 lastPolledSlot 的并发访问
 }
 
 func ListenerStart(ctx context.Context, dbConn *gorm.DB, rpcURL, wsURL, usdcMint string, syncInterval time.Duration, configStartHeight uint64) {

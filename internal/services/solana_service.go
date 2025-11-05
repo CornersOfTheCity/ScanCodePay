@@ -537,11 +537,32 @@ func CreateRefundTx(ctx context.Context, orderID, refundTo string, refundAmount 
 		[]byte(memoText),
 	)
 
-	// 创建交易，包含转账和Memo指令，使用Payer作为 fee payer（统一所有交易的fee payer）
+	// 获取推荐的优先级费用（根据网络拥堵情况动态调整）
+	priorityFee := getRecommendedPriorityFee(ctx)
+	fmt.Printf("[DEBUG] 使用优先级费用: %d microlamports/compute unit\n", priorityFee)
+
+	// 创建 ComputeBudget 指令来设置优先级费用
+	// ComputeBudget Program ID: ComputeBudget111111111111111111111111111111
+	computeBudgetProgramID := solana.MustPublicKeyFromBase58("ComputeBudget111111111111111111111111111111")
+	
+	// ComputeBudget 指令格式：
+	// - computeUnitLimit: 设置计算单元限制（默认 200000，对于简单转账可以设置为 100000）
+	// - computeUnitPrice: 设置优先级费用（microlamports per compute unit）
+	instructions := []solana.Instruction{
+		// 设置计算单元限制（可选，但推荐设置以避免超限）
+		buildComputeUnitLimitInstruction(computeBudgetProgramID, 100000),
+		// 设置优先级费用
+		buildComputeUnitPriceInstruction(computeBudgetProgramID, priorityFee),
+		// 转账和 Memo 指令
+		transferInstruction,
+		memoInstruction,
+	}
+
+	// 创建交易，包含 ComputeBudget、转账和Memo指令，使用Payer作为 fee payer（统一所有交易的fee payer）
 	// 这样所有USDC交易（收款和退款）都可以通过监听Payer地址统一捕获
 	payerPubkey := Payer.PublicKey()
 	tx, err := solana.NewTransaction(
-		[]solana.Instruction{transferInstruction, memoInstruction},
+		instructions,
 		bh.Value.Blockhash,
 		solana.TransactionPayer(payerPubkey),
 	)
@@ -720,4 +741,100 @@ func CreateRefundTx(ctx context.Context, orderID, refundTo string, refundAmount 
 	explorerURL := "https://explorer.solana.com/tx/" + signature + "?cluster=mainnet"
 
 	return signature, explorerURL, nil
+}
+
+// getRecommendedPriorityFee 获取推荐的优先级费用（根据网络拥堵情况动态调整）
+// 返回 microlamports per compute unit
+func getRecommendedPriorityFee(ctx context.Context) uint64 {
+	// 默认优先级费用（5000 microlamports = 0.000005 SOL per compute unit）
+	// 对于简单转账（约 100000 compute units），这相当于 0.0005 SOL 的优先级费用
+	defaultPriorityFee := uint64(5000)
+
+	// 尝试从配置中读取基础优先级费用
+	basePriorityFee := viper.GetUint64("solana.base_priority_fee")
+	if basePriorityFee == 0 {
+		basePriorityFee = defaultPriorityFee
+	}
+
+	// 尝试获取最近的交易优先级费用来估算网络拥堵情况
+	// 注意：这是一个简化的实现，实际可以使用更复杂的算法
+	// 例如：查询最近的交易，计算平均优先级费用，然后根据网络拥堵程度调整
+	recentPriorityFee, err := estimateNetworkPriorityFee(ctx)
+	if err != nil {
+		// 如果估算失败，使用配置的基础费用
+		fmt.Printf("[DEBUG] 无法估算网络优先级费用，使用默认值: %d\n", basePriorityFee)
+		return basePriorityFee
+	}
+
+	// 使用估算值和配置值的较大值，确保交易能够快速处理
+	recommendedFee := recentPriorityFee
+	if basePriorityFee > recommendedFee {
+		recommendedFee = basePriorityFee
+	}
+
+	// 设置上限（避免费用过高）
+	maxPriorityFee := viper.GetUint64("solana.max_priority_fee")
+	if maxPriorityFee == 0 {
+		maxPriorityFee = 50000 // 默认上限：50000 microlamports
+	}
+	if recommendedFee > maxPriorityFee {
+		recommendedFee = maxPriorityFee
+		fmt.Printf("[DEBUG] 优先级费用超过上限，限制为: %d\n", maxPriorityFee)
+	}
+
+	fmt.Printf("[DEBUG] 推荐优先级费用: %d microlamports/compute unit (估算值: %d, 配置基础值: %d)\n",
+		recommendedFee, recentPriorityFee, basePriorityFee)
+
+	return recommendedFee
+}
+
+// estimateNetworkPriorityFee 估算网络当前的优先级费用
+// 通过查询最近的交易来估算网络拥堵程度
+func estimateNetworkPriorityFee(ctx context.Context) (uint64, error) {
+	// 简化实现：返回一个基于时间的估算值
+	// 实际应用中，可以通过查询 RPC 的 getRecentPrioritizationFees 来获取更准确的估算
+	// 或者根据最近的交易失败率来动态调整
+
+	// 当前实现：返回一个中等优先级的费用（可以根据需要调整）
+	// 如果网络拥堵，可以增加这个值
+	estimatedFee := uint64(10000) // 10000 microlamports = 0.00001 SOL per compute unit
+
+	// TODO: 可以在这里实现更复杂的网络拥堵检测逻辑
+	// 例如：查询最近的交易，如果失败率高或确认时间长，则增加优先级费用
+
+	return estimatedFee, nil
+}
+
+// buildComputeUnitLimitInstruction 构建设置计算单元限制的指令
+// computeUnitLimit: 计算单元限制（推荐 100000 对于简单转账）
+func buildComputeUnitLimitInstruction(computeBudgetProgramID solana.PublicKey, computeUnitLimit uint32) solana.Instruction {
+	// ComputeBudget SetComputeUnitLimit 指令格式：
+	// - instruction discriminator: 2 (SetComputeUnitLimit)
+	// - compute_unit_limit: 4 bytes (uint32, little-endian)
+	data := make([]byte, 5)
+	data[0] = 2 // SetComputeUnitLimit
+	binary.LittleEndian.PutUint32(data[1:5], computeUnitLimit)
+
+	return solana.NewInstruction(
+		computeBudgetProgramID,
+		solana.AccountMetaSlice{},
+		data,
+	)
+}
+
+// buildComputeUnitPriceInstruction 构建设置优先级费用的指令
+// computeUnitPrice: 优先级费用（microlamports per compute unit）
+func buildComputeUnitPriceInstruction(computeBudgetProgramID solana.PublicKey, computeUnitPrice uint64) solana.Instruction {
+	// ComputeBudget SetComputeUnitPrice 指令格式：
+	// - instruction discriminator: 3 (SetComputeUnitPrice)
+	// - micro_lamports: 8 bytes (uint64, little-endian)
+	data := make([]byte, 9)
+	data[0] = 3 // SetComputeUnitPrice
+	binary.LittleEndian.PutUint64(data[1:9], computeUnitPrice)
+
+	return solana.NewInstruction(
+		computeBudgetProgramID,
+		solana.AccountMetaSlice{},
+		data,
+	)
 }
